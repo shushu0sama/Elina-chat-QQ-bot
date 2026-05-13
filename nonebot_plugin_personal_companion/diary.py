@@ -47,7 +47,7 @@ class DiaryWriter:
     async def _generate(self, messages: list[dict], date_str: str) -> str | None:
         conversation = []
         for m in messages:
-            role_label = "你" if m["role"] == "user" else "小鼠"
+            role_label = "你" if m["role"] == "user" else "艾琳娜"
             content = m["content"]
             if len(content) > 300:
                 content = content[:300] + "..."
@@ -59,14 +59,14 @@ class DiaryWriter:
         conversation_text = "\n".join(conversation)
 
         prompt = (
-            f"以下是{date_str}你和一个朋友的完整对话记录。请你以朋友「小鼠」的口吻，"
+            f"以下是{date_str}你和一个朋友的完整对话记录。请你以朋友「艾琳娜」的口吻，"
             "为对方写一篇个人日记。\n\n"
             "要求：\n"
             "- 用第二人称「你」来写，像是在帮朋友记日记\n"
-            "- 分三个小节：## 聊聊 / ## 今日心情 / ## 小鼠的碎碎念\n"
+            "- 分三个小节：## 聊聊 / ## 今日心情 / ## 艾琳娜的碎碎念\n"
             "- 「聊聊」：总结今天聊了哪些话题，简洁但不遗漏重要内容\n"
             "- 「今日心情」：根据对话推测对方今天的情绪变化\n"
-            "- 「小鼠的碎碎念」：以小鼠的视角写几句温柔的观察或感慨，1-3句话\n"
+            "- 「艾琳娜的碎碎念」：以艾琳娜的视角写几句温柔的观察或感慨，1-3句话\n"
             "- 语气自然、温柔，不肉麻，不鸡汤\n"
             "- 300-500字，不要太长\n\n"
             f"[对话记录]\n{conversation_text}"

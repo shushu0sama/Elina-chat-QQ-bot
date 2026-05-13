@@ -76,7 +76,7 @@ class LLMClient:
             return []
 
         conversation = "\n".join(
-            f"{'用户' if m['role'] == 'user' else '小鼠'}: {m['content']}"
+            f"{'用户' if m['role'] == 'user' else '艾琳娜'}: {m['content']}"
             for m in recent_messages
         )
         existing_block = "\n".join(f"- {m}" for m in existing_memories) if existing_memories else "（暂无）"

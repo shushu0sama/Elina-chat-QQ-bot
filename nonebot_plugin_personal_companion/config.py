@@ -33,7 +33,7 @@ class Config(BaseModel):
     content_push_max_per_push: int = 1
 
     # Bot identity
-    bot_nickname: str = "小鼠"
+    bot_nickname: str = "艾琳娜"
 
     class Config:
         extra = "allow"

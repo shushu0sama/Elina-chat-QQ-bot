@@ -1,10 +1,10 @@
 @echo off
-title Mouse - QQ Bot
+title Elena - QQ Bot
 cd /d "D:\code\QQ chat"
 
 echo.
 echo ========================================
-echo     Mouse QQ Bot Launcher
+echo     Elena QQ Bot Launcher
 echo ========================================
 echo.
 
@@ -16,7 +16,7 @@ echo.
 
 :: 2. Bot
 echo [2/2] Starting Bot...
-start "MouseBot" cmd /c "cd /d D:\code\QQ chat && venv\Scripts\python bot.py"
+start "ElenaBot" cmd /c "cd /d D:\code\QQ chat && venv\Scripts\python bot.py"
 echo        Bot window opened
 echo.
 
@@ -58,7 +58,7 @@ exit
 :success
 echo.
 echo ========================================
-echo    [OK] Mouse Bot is running!
+echo    [OK] Elena Bot is running!
 echo.
 echo    Bot address: 127.0.0.1:18080
 echo    Check system tray for NapCat icon
