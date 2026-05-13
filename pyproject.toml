@@ -1,0 +1,19 @@
+[project]
+name = "qq-personal-companion"
+version = "0.1.0"
+description = "Personal AI companion bot for QQ using NoneBot2 + DeepSeek"
+requires-python = ">=3.10"
+dependencies = [
+    "nonebot2[fastapi]>=2.3.0",
+    "nonebot-adapter-onebot>=2.4.0",
+    "openai>=1.0.0",
+    "jieba>=0.42.1",
+    "python-dotenv>=1.0.0",
+    "nb-cli>=1.4.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "nonebot2[websockets]",
+]

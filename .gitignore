@@ -1,0 +1,31 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment (contains API keys)
+.env
+
+# Database (generated data)
+*.db
+*.db-shm
+*.db-wal
+
+# Diaries (personal content)
+nonebot_plugin_personal_companion/diaries/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
