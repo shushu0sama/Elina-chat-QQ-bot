@@ -17,15 +17,45 @@ def _load_yaml(path: Path) -> dict:
         return yaml.safe_load(f)
 
 
-def _time_hint(hour: int) -> str:
-    """Return a lightweight time-of-day flavor line."""
-    if hour >= 23 or hour <= 4:
-        return "深夜了。如果对方在熬夜，可以随口关心一下。"
-    if hour <= 8:
-        return "现在是早晨，说话可以带点刚睡醒的感觉。"
-    if 12 <= hour <= 13:
-        return "午休时间，语气可以轻松随意一点。"
-    return ""
+def _time_context(now: datetime) -> str:
+    """Return a precise time-of-day context so the bot is aware of the current time."""
+    hour = now.hour
+    minute = now.minute
+    time_str = f"{hour:02d}:{minute:02d}"
+    weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
+
+    if 23 <= hour or hour <= 4:
+        period = "深夜"
+        vibe = "大部分人已经睡了。如果对方还在线，可能是在熬夜。语气温柔一点，可以关心但不唠叨。对方提到睡觉相关的事，回复要符合深夜语境。"
+    elif 5 <= hour <= 7:
+        period = "清晨"
+        vibe = "天刚亮不久。对方可能是早起的人。"
+    elif 8 <= hour <= 10:
+        period = "上午"
+        vibe = "一天的开始。对方可能在准备工作或已经开始忙碌。"
+    elif 11 <= hour <= 12:
+        period = "午前"
+        vibe = "快到午饭时间了。对方可能有点饿了或者准备休息。"
+    elif 13 <= hour <= 14:
+        period = "午后"
+        vibe = "刚过午饭，人容易犯困。语气可以轻松随意一点。"
+    elif 15 <= hour <= 17:
+        period = "下午"
+        vibe = "下午工作时间。对方可能在忙，或者快下班了。"
+    elif 18 <= hour <= 19:
+        period = "傍晚"
+        vibe = "晚饭时间。对方可能刚下班/放学，在吃饭或者准备晚上的安排。注意：现在是傍晚不是睡觉时间，不要对睡觉相关话题说晚安。"
+    elif 20 <= hour <= 22:
+        period = "晚上"
+        vibe = "晚上的休息时间。对方可能在放松、看东西、或者做自己的事。离睡觉还有一段时间。"
+    else:
+        period = "深夜前夕"
+        vibe = "时间不早了但还不是深夜。对方可能在准备休息了。"
+
+    return (
+        f"现在是北京时间 {time_str}，{weekday}{period}。{vibe}\n"
+        f"重要：你的所有回复必须与当前时间吻合。不要在不合理的时间说早安/晚安/午安。"
+    )
 
 
 def _roll_state(cfg: dict, user_id: int) -> dict:
@@ -63,7 +93,13 @@ def build_system_prompt(persona_path: Path | None = None, user_id: int = 0) -> s
     # Roll state (mood)
     state = _roll_state(cfg, user_id)
 
+    # Current time (prominent — bot must be time-aware)
+    now = datetime.now()
+    time_ctx = _time_context(now)
+
     lines = [
+        time_ctx,
+        "",
         f"你的名字是{voice['name']}。",
         voice["style"],
         "",
@@ -110,11 +146,5 @@ def build_system_prompt(persona_path: Path | None = None, user_id: int = 0) -> s
         for fb in forbidden:
             lines.append(f"- {fb}")
         lines.append("")
-
-    # Time flavor
-    now = datetime.now()
-    time_hint = _time_hint(now.hour)
-    if time_hint:
-        lines.append(time_hint)
 
     return "\n".join(lines)
