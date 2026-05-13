@@ -148,7 +148,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent):
         else:
             # Vision failed, fall back to text-only
             user_msg_for_llm = f"（对方发了一张图片，说：{user_msg}。你看不到图片，根据文字回应。）"
-            _process_text_message(user_msg_for_llm, event, bot)
+            await _process_text_message(user_msg_for_llm, event, bot)
         return
 
     if face_ids and not user_msg:
@@ -183,10 +183,10 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent):
                 memory_store.save_message("assistant", first_step, event.user_id)
             return
 
-    _process_text_message(user_msg, event, bot)
+    await _process_text_message(user_msg, event, bot)
 
 
-def _process_text_message(user_msg: str, event, bot):
+async def _process_text_message(user_msg: str, event, bot):
     """Handle a regular text message (extracted from main handler for reuse)."""
     global memory_store, llm, plugin_config
 
