@@ -17,6 +17,13 @@ class ProactiveChat:
         self.config = config
         self.kb = kb
 
+    def _filter_allowed(self, user_ids: list[int]) -> list[int]:
+        allow = self.config.proactive_allow_users.strip()
+        if not allow:
+            return user_ids
+        allowed = {int(x.strip()) for x in allow.split(",") if x.strip()}
+        return [uid for uid in user_ids if uid in allowed]
+
     async def try_proactive(self):
         if not self.config.proactive_enabled:
             return
@@ -25,7 +32,7 @@ class ProactiveChat:
         if not (self.config.proactive_active_hours_start <= now.hour < self.config.proactive_active_hours_end):
             return
 
-        user_ids = self.memory.get_active_user_ids()
+        user_ids = self._filter_allowed(self.memory.get_active_user_ids())
         if not user_ids:
             return
 

@@ -3,15 +3,24 @@ from datetime import datetime, timedelta
 
 from .llm_client import LLMClient
 from .memory import MemoryStore
+from .config import Config
 
 DIARIES_DIR = Path(__file__).parent / "diaries"
 
 
 class DiaryWriter:
-    def __init__(self, llm: LLMClient, memory: MemoryStore):
+    def __init__(self, llm: LLMClient, memory: MemoryStore, config: Config):
         self.llm = llm
         self.memory = memory
+        self.config = config
         DIARIES_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _filter_allowed(self, user_ids: list[int]) -> list[int]:
+        allow = self.config.proactive_allow_users.strip()
+        if not allow:
+            return user_ids
+        allowed = {int(x.strip()) for x in allow.split(",") if x.strip()}
+        return [uid for uid in user_ids if uid in allowed]
 
     async def write_daily_diary(self):
         """Generate and save diary entries for all active users. Called by midnight cron."""
@@ -20,7 +29,7 @@ class DiaryWriter:
         diary_date = yesterday.strftime("%Y-%m-%d")
         since = yesterday.strftime("%Y-%m-%d 00:00:00")
 
-        user_ids = self.memory.get_active_user_ids()
+        user_ids = self._filter_allowed(self.memory.get_active_user_ids())
         if not user_ids:
             print("[Diary] No active users, skipping")
             return

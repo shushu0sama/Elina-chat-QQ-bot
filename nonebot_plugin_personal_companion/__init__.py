@@ -316,7 +316,7 @@ async def _startup():
     proactive_chat = ProactiveChat(memory_store, llm, plugin_config, knowledge_base)
     flow_manager = FlowManager(llm)
     bili_fetcher = BilibiliFetcher(llm, memory_store, plugin_config)
-    diary_writer = DiaryWriter(llm, memory_store)
+    diary_writer = DiaryWriter(llm, memory_store, plugin_config)
 
     # Register proactive chat job
     scheduler.add_job(

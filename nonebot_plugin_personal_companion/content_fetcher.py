@@ -52,6 +52,13 @@ class BilibiliFetcher:
         self.config = config
         self._last_push: dict[int, float] = {}  # user_id -> last push timestamp
 
+    def _filter_allowed(self, user_ids: list[int]) -> list[int]:
+        allow = self.config.proactive_allow_users.strip()
+        if not allow:
+            return user_ids
+        allowed = {int(x.strip()) for x in allow.split(",") if x.strip()}
+        return [uid for uid in user_ids if uid in allowed]
+
     # ── public API ────────────────────────────────────────────
 
     async def try_push(self):
@@ -64,7 +71,7 @@ class BilibiliFetcher:
         if not (self.config.proactive_active_hours_start <= hour < self.config.proactive_active_hours_end):
             return
 
-        user_ids = self.memory.get_active_user_ids()
+        user_ids = self._filter_allowed(self.memory.get_active_user_ids())
         if not user_ids:
             return
 

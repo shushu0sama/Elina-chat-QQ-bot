@@ -21,10 +21,11 @@ class Config(BaseModel):
 
     # Proactive chat
     proactive_enabled: bool = True
+    proactive_allow_users: str = ""  # comma-separated QQ IDs, empty = all
     proactive_interval_minutes: int = 30
     proactive_cooldown_minutes: int = 60
-    proactive_active_hours_start: int = 9
-    proactive_active_hours_end: int = 23
+    proactive_active_hours_start: int = 8
+    proactive_active_hours_end: int = 24
 
     # Content push (Bilibili)
     content_push_enabled: bool = True
