@@ -34,6 +34,35 @@ class LLMClient:
 
         return f"我好像连接不上大脑了，稍等一下再试试？({self._error_hint(last_error)})"
 
+    def chat_vision(self, text: str, image_urls: list[str], system_prompt: str = "",
+                    max_retries: int = 2, max_tokens: int = 512) -> str:
+        """Send a vision request with images. Falls back gracefully on failure."""
+        content: list[dict] = [{"type": "text", "text": text}]
+        for url in image_urls:
+            content.append({"type": "image_url", "image_url": {"url": url}})
+
+        messages: list[dict] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": content})
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.8,
+                    max_tokens=max_tokens,
+                )
+                return response.choices[0].message.content or ""
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(2**attempt)
+
+        return ""
+
     @staticmethod
     def _error_hint(error: Exception | None) -> str:
         if error is None:

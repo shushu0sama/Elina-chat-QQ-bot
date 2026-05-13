@@ -40,21 +40,54 @@ private_msg = on_message(
 )
 
 
+async def _extract_images(bot: Bot, event: PrivateMessageEvent) -> list[str]:
+    """Extract downloadable image URLs from an event's message segments."""
+    urls: list[str] = []
+    for seg in event.message:
+        if seg.type == "image":
+            file_val = seg.data.get("file", "")
+            # If already an HTTP URL, use directly
+            if file_val.startswith("http"):
+                urls.append(file_val)
+            else:
+                try:
+                    info = await bot.get_image(file=file_val)
+                    url = info.get("url", "")
+                    if url:
+                        urls.append(url)
+                except Exception:
+                    pass
+    return urls
+
+
+def _extract_faces(event: PrivateMessageEvent) -> list[str]:
+    """Extract QQ face IDs from an event."""
+    return [seg.data.get("id", "") for seg in event.message if seg.type == "face"]
+
+
 @private_msg.handle()
 async def handle_private_message(bot: Bot, event: PrivateMessageEvent):
     global memory_store, llm, plugin_config, flow_manager
 
     user_msg = event.get_plaintext().strip()
+    image_urls = await _extract_images(bot, event)
+    face_ids = _extract_faces(event)
 
-    # Record user activity (even for empty messages — they're online)
+    # Record user activity
     memory_store.record_user_active(event.user_id)
 
     # ── Flow session: user is in the middle of an interactive tool ──
     if flow_manager and flow_manager.has_session(event.user_id):
-        if not user_msg:
+        if not user_msg and not image_urls:
             return
 
-        # Check if user wants to exit
+        # In flow session, images/faces get a simple acknowledgment
+        if image_urls:
+            await bot.send(event, "看到啦，不过现在我们还在走流程~ 要继续吗？还是先算了？")
+            return
+        if face_ids:
+            return  # Silently ignore faces during flow
+
         if flow_manager.check_exit(event.user_id, user_msg):
             exit_msg = flow_manager.exit_session(event.user_id)
             if exit_msg:
@@ -62,32 +95,100 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent):
                     await bot.send(event, chunk)
             return
 
-        # Advance the flow
         next_msg = await flow_manager.advance(event.user_id, user_msg)
         if next_msg:
             for chunk in LLMClient.chunk_text(next_msg):
                 await bot.send(event, chunk)
         else:
-            # Session ended unexpectedly — ensure cleanup
             flow_manager.exit_session(event.user_id)
+        return
+
+    # ── Image/face handling (outside flow sessions) ──
+    if image_urls and not user_msg:
+        # Pure image: use vision to understand and respond
+        prompt = (
+            "朋友给你发了一张图片。请用自然、朋友间聊天的语气回应这张图片的内容。"
+            "可以描述你看到的、表达你的感受或想法。2-3句话即可，不要太长。"
+            "如果你看不懂这张图（比如是纯色块或模糊的），就诚实地说看不清。"
+        )
+        reply = llm.chat_vision(prompt, image_urls[:3], max_tokens=384)
+        if reply:
+            memory_store.save_message("user", "[图片]", event.user_id)
+            memory_store.save_message("assistant", reply, event.user_id)
+            for chunk in LLMClient.chunk_text(reply):
+                await bot.send(event, chunk)
+        else:
+            # Vision failed — natural fallback
+            fallbacks = [
+                "看到了~",
+                "收到！",
+                "哈哈哈这个是啥",
+                "有意思",
+            ]
+            import random as _random
+            fb = _random.choice(fallbacks)
+            memory_store.save_message("user", "[图片]", event.user_id)
+            memory_store.save_message("assistant", fb, event.user_id)
+            await bot.send(event, fb)
+        return
+
+    if image_urls and user_msg:
+        # Mixed: text + image — include both in context
+        prompt = (
+            f"朋友给你发了一张图片，同时说：「{user_msg}」。"
+            "请结合图片内容回应对方。语气自然，像朋友聊天。2-3句话。"
+            "如果你实在看不清图片，就根据对方的文字回应，顺便提一句图片没加载出来。"
+        )
+        reply = llm.chat_vision(prompt, image_urls[:3], max_tokens=384)
+        if reply:
+            memory_store.save_message("user", f"[图片] {user_msg}", event.user_id)
+            memory_store.save_message("assistant", reply, event.user_id)
+            for chunk in LLMClient.chunk_text(reply):
+                await bot.send(event, chunk)
+        else:
+            # Vision failed, fall back to text-only
+            user_msg_for_llm = f"（对方发了一张图片，说：{user_msg}。你看不到图片，根据文字回应。）"
+            _process_text_message(user_msg_for_llm, event, bot)
+        return
+
+    if face_ids and not user_msg:
+        # Pure emoji/sticker — simple natural acknowledgment
+        import random as _random
+        face_replies = [
+            "哈哈哈",
+            "笑死",
+            "好的",
+            "嗯嗯",
+            "收到了",
+            "懂了",
+        ]
+        reply = _random.choice(face_replies)
+        memory_store.save_message("user", "[表情]", event.user_id)
+        memory_store.save_message("assistant", reply, event.user_id)
+        await bot.send(event, reply)
         return
 
     if not user_msg:
         return
 
-    # ── Flow tool request: user explicitly asks for a tool ──
+    # ── Flow tool request ──
     if flow_manager:
         tool = flow_manager.detect_tool_request(user_msg)
         if tool:
             first_step = flow_manager.start_session(event.user_id, tool, user_msg)
-            # Save user message first
             memory_store.save_message("user", user_msg, event.user_id)
-            # Send the first step
             if first_step:
                 for chunk in LLMClient.chunk_text(first_step):
                     await bot.send(event, chunk)
                 memory_store.save_message("assistant", first_step, event.user_id)
             return
+
+    _process_text_message(user_msg, event, bot)
+
+
+def _process_text_message(user_msg: str, event, bot):
+    """Handle a regular text message (extracted from main handler for reuse)."""
+    global memory_store, llm, plugin_config
 
     # 1. Save user message
     msg_id = memory_store.save_message("user", user_msg, event.user_id)
@@ -116,10 +217,10 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent):
     for chunk in LLMClient.chunk_text(reply):
         await bot.send(event, chunk)
 
-    # 8. Auto-extract memories (async, after reply sent)
+    # 8. Auto-extract memories
     await _maybe_extract_memories(event.user_id)
 
-    # 9. Check if we should generate a summary
+    # 9. Generate summary if needed
     if memory_store.message_count_since_last_summary() >= plugin_config.summary_trigger_count:
         recent = memory_store.get_recent_messages(plugin_config.max_recent_messages, event.user_id)
         summary = llm.generate_summary(recent)
