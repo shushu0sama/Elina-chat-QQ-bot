@@ -39,6 +39,8 @@ class MemoryStore:
                     content TEXT NOT NULL,
                     user_id INTEGER,
                     source_msg_id INTEGER,
+                    importance INTEGER DEFAULT 1,
+                    access_count INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -53,7 +55,10 @@ class MemoryStore:
                     sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-            for col, table in [("user_id", "messages"), ("user_id", "summaries"), ("user_id", "key_memories")]:
+            for col, table in [
+                ("user_id", "messages"), ("user_id", "summaries"), ("user_id", "key_memories"),
+                ("importance", "key_memories"), ("access_count", "key_memories"),
+            ]:
                 try:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} INTEGER")
                 except Exception:
@@ -131,36 +136,52 @@ class MemoryStore:
 
     # ── key memories ───────────────────────────────────────────
 
-    def add_key_memory(self, content: str, source_msg_id: int | None = None, user_id: int | None = None):
+    def add_key_memory(self, content: str, source_msg_id: int | None = None,
+                       user_id: int | None = None, importance: int = 1):
         with self._get_conn() as conn:
             conn.execute(
-                "INSERT INTO key_memories (content, source_msg_id, user_id) VALUES (?, ?, ?)",
-                (content, source_msg_id, user_id),
+                "INSERT INTO key_memories (content, source_msg_id, user_id, importance) VALUES (?, ?, ?, ?)",
+                (content, source_msg_id, user_id, importance),
             )
 
     def retrieve_memories(self, keywords: list[str], user_id: int, limit: int = 5) -> list[str]:
-        results: list[tuple[str, int]] = []
+        results: list[tuple[str, float]] = []
         with self._get_conn() as conn:
             for kw in keywords:
-                mem_rows = conn.execute(
-                    "SELECT content FROM key_memories WHERE user_id = ? AND content LIKE ?",
+                rows = conn.execute(
+                    "SELECT content, importance, access_count FROM key_memories WHERE user_id = ? AND content LIKE ?",
                     (user_id, f"%{kw}%"),
                 ).fetchall()
-                for row in mem_rows:
-                    results.append((row["content"], 1))
+                for row in rows:
+                    # Score: base 1 + importance boost (0-4) + access boost (log-scaled)
+                    imp = row["importance"] or 1
+                    acc = row["access_count"] or 0
+                    boost = imp * 0.5 + min(acc * 0.1, 1.5)
+                    results.append((row["content"], 1.0 + boost))
                 sum_rows = conn.execute(
                     "SELECT summary_text FROM summaries WHERE user_id = ? AND summary_text LIKE ?",
                     (user_id, f"%{kw}%"),
                 ).fetchall()
                 for row in sum_rows:
-                    results.append((row["summary_text"], 2))
+                    results.append((row["summary_text"], 2.0))
+
         seen = set()
         unique: list[str] = []
         for content, score in sorted(results, key=lambda x: x[1], reverse=True):
             if content not in seen:
                 seen.add(content)
                 unique.append(content)
-        return unique[:limit]
+
+        # Increment access_count for retrieved memories
+        top = unique[:limit]
+        if top:
+            with self._get_conn() as conn:
+                for content in top:
+                    conn.execute(
+                        "UPDATE key_memories SET access_count = access_count + 1, last_accessed_at = CURRENT_TIMESTAMP WHERE user_id = ? AND content = ?",
+                        (user_id, content),
+                    )
+        return top
 
     def get_all_key_memories(self, user_id: int | None = None) -> list[str]:
         with self._get_conn() as conn:
@@ -193,6 +214,16 @@ class MemoryStore:
             if total > 0 and common / total > threshold:
                 return True
         return False
+
+    def prune_stale_memories(self, user_id: int, min_importance: int = 2, days_unused: int = 30):
+        """Delete low-importance memories that haven't been accessed in N days."""
+        with self._get_conn() as conn:
+            conn.execute(
+                """DELETE FROM key_memories WHERE user_id = ?
+                   AND importance < ?
+                   AND last_accessed_at < datetime('now', ? || ' days')""",
+                (user_id, min_importance, -days_unused),
+            )
 
     def messages_since_last_extraction(self, user_id: int) -> int:
         with self._get_conn() as conn:

@@ -198,7 +198,7 @@ async def _process_text_message(user_msg: str, event, bot):
     # 2. Check if user wants to save a memory explicitly
     if user_msg.startswith("记住："):
         memory_text = user_msg[3:].strip()
-        memory_store.add_key_memory(memory_text, source_msg_id=msg_id, user_id=event.user_id)
+        memory_store.add_key_memory(memory_text, source_msg_id=msg_id, user_id=event.user_id, importance=5)
         await bot.send(event, f"记住了：{memory_text}")
         return
 
@@ -257,6 +257,11 @@ async def _maybe_extract_memories(user_id: int):
     if added > 0:
         print(f"[Companion] Auto-extracted {added} new memories (total: {memory_store.count_key_memories(user_id)})")
 
+    # Clean stale low-priority memories every ~50 messages
+    if count >= plugin_config.auto_extract_interval and count % 50 < plugin_config.auto_extract_interval:
+        memory_store.prune_stale_memories(user_id, min_importance=2, days_unused=14)
+        print(f"[Companion] Pruned stale memories for user {user_id}")
+
 
 def _extract_keywords(text: str, top_n: int = 5) -> list[str]:
     words = jieba.cut(text)
@@ -288,12 +293,17 @@ def _build_messages(user_msg: str, retrieved_memories: list[str], user_id: int =
         if rel_prompt:
             messages.append({"role": "system", "content": rel_prompt})
 
+    # System: conversation thread (keeps multi-turn coherence)
+    recent = memory_store.get_recent_messages(plugin_config.max_recent_messages, user_id)
+    thread_ctx = _build_thread_context(recent, user_msg)
+    if thread_ctx:
+        messages.append({"role": "system", "content": thread_ctx})
+
     # System: personality
     personality_prompt = build_system_prompt(user_id=user_id)
     messages.append({"role": "system", "content": personality_prompt})
 
     # Conversation history
-    recent = memory_store.get_recent_messages(plugin_config.max_recent_messages, user_id)
     for msg in recent:
         messages.append(msg)
 
@@ -301,6 +311,49 @@ def _build_messages(user_msg: str, retrieved_memories: list[str], user_id: int =
         messages.append({"role": "user", "content": user_msg})
 
     return messages
+
+
+def _build_thread_context(recent_messages: list[dict], current_msg: str) -> str:
+    """Build a compact context line summarizing the recent conversation thread."""
+    if len(recent_messages) < 2:
+        return ""
+
+    # Take the last 3-4 exchanges (6-8 messages)
+    recent_exchanges = recent_messages[-8:]
+    user_msgs = [m["content"] for m in recent_exchanges if m["role"] == "user"]
+
+    if not user_msgs:
+        return ""
+
+    # Extract keywords from recent user messages to detect topic continuity
+    all_keywords: list[str] = []
+    for msg in user_msgs[-3:]:
+        all_keywords.extend(_extract_keywords(msg, top_n=3))
+
+    # Find recurring keywords (appear in >= 2 recent messages)
+    from collections import Counter
+    kw_counts = Counter(all_keywords)
+    recurring = [kw for kw, cnt in kw_counts.items() if cnt >= 2]
+
+    lines = ["[当前对话线索——请在回复时保持话题连贯：]"]
+    if recurring:
+        lines.append(f"- 对方最近反复提到的词：{'、'.join(recurring[:3])}")
+
+    # Summarize the last exchange
+    if len(recent_exchanges) >= 2:
+        last = recent_exchanges[-2:]
+        summary_parts = []
+        for m in last:
+            role = "对方" if m["role"] == "user" else "你"
+            snippet = m["content"][:60].replace("\n", " ")
+            summary_parts.append(f"{role}：{snippet}")
+        lines.append(f"- 上一轮：{' | '.join(summary_parts)}")
+
+    if lines:
+        lines.append("- 现在对方说：" + current_msg[:100])
+        lines.append("- 请确保你的回应承接上一轮的话题。如果对方用了代词（'那个''它''这样'），要根据上下文理解具体指什么。")
+
+    return "\n".join(lines)
 
 
 @get_driver().on_startup
