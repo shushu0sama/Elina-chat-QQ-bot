@@ -105,7 +105,7 @@ class ProactiveChat:
             time_ctx = "现在是晚上。语气柔和一点，关心对方今天的状态和心情。"
 
         # Get user memories
-        memories = self.memory.get_all_key_memories()
+        memories = self.memory.get_all_key_memories(user_id)
         memory_block = ""
         if memories:
             memory_block = "你记得关于对方的一些事：\n" + "\n".join(f"- {m}" for m in memories[:10])

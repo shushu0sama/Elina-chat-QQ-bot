@@ -30,7 +30,7 @@ class RelationshipProfiler:
         style = self._classify_style(avg_len, total)
 
         # Topic preferences from key memories
-        memories = self.memory.get_all_key_memories()
+        memories = self.memory.get_all_key_memories(user_id)
         topics = self._extract_topics(memories)
 
         # Build adaptation hint

@@ -198,13 +198,13 @@ async def _process_text_message(user_msg: str, event, bot):
     # 2. Check if user wants to save a memory explicitly
     if user_msg.startswith("记住："):
         memory_text = user_msg[3:].strip()
-        memory_store.add_key_memory(memory_text, source_msg_id=msg_id)
+        memory_store.add_key_memory(memory_text, source_msg_id=msg_id, user_id=event.user_id)
         await bot.send(event, f"记住了：{memory_text}")
         return
 
     # 3. Retrieve relevant memories
     keywords = _extract_keywords(user_msg)
-    retrieved = memory_store.retrieve_memories(keywords)
+    retrieved = memory_store.retrieve_memories(keywords, event.user_id)
 
     # 4. Build the full message list for the LLM
     messages = _build_messages(user_msg, retrieved, event.user_id)
@@ -223,18 +223,18 @@ async def _process_text_message(user_msg: str, event, bot):
     await _maybe_extract_memories(event.user_id)
 
     # 9. Generate summary if needed
-    if memory_store.message_count_since_last_summary() >= plugin_config.summary_trigger_count:
+    if memory_store.message_count_since_last_summary(event.user_id) >= plugin_config.summary_trigger_count:
         recent = memory_store.get_recent_messages(plugin_config.max_recent_messages, event.user_id)
         summary = llm.generate_summary(recent)
         if summary:
-            memory_store.save_summary(summary, 0, 0)
+            memory_store.save_summary(summary, 0, 0, event.user_id)
 
 
 async def _maybe_extract_memories(user_id: int):
     """Periodically auto-extract new facts about the user from recent conversation."""
     global memory_store, llm, plugin_config
 
-    count = memory_store.messages_since_last_extraction()
+    count = memory_store.messages_since_last_extraction(user_id)
     if count < plugin_config.auto_extract_interval:
         return
 
@@ -242,21 +242,20 @@ async def _maybe_extract_memories(user_id: int):
     if len(recent) < 5:
         return
 
-    existing = memory_store.get_all_key_memories()
+    existing = memory_store.get_all_key_memories(user_id)
     new_memories = llm.extract_memories(recent, existing)
 
     if not new_memories:
-        # Mark as processed even if nothing found (avoid re-extracting same messages)
         return
 
     added = 0
     for mem in new_memories:
-        if not memory_store.has_similar_memory(mem):
-            memory_store.add_key_memory(mem)
+        if not memory_store.has_similar_memory(mem, user_id):
+            memory_store.add_key_memory(mem, user_id=user_id)
             added += 1
 
     if added > 0:
-        print(f"[Companion] Auto-extracted {added} new memories (total: {memory_store.count_key_memories()})")
+        print(f"[Companion] Auto-extracted {added} new memories (total: {memory_store.count_key_memories(user_id)})")
 
 
 def _extract_keywords(text: str, top_n: int = 5) -> list[str]:

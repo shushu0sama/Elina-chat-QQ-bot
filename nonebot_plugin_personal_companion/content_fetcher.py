@@ -91,7 +91,7 @@ class BilibiliFetcher:
 
         # Match against user interests and push to each user
         for uid in user_ids:
-            interests = self._get_user_interests()
+            interests = self._get_user_interests(uid)
             top = self._filter_by_interest(videos, interests, limit=3)
             if not top:
                 continue
@@ -171,9 +171,9 @@ class BilibiliFetcher:
 
     # ── interest matching ─────────────────────────────────────
 
-    def _get_user_interests(self) -> list[str]:
+    def _get_user_interests(self, user_id: int) -> list[str]:
         """Extract interest keywords from user's key memories."""
-        memories = self.memory.get_all_key_memories()
+        memories = self.memory.get_all_key_memories(user_id)
         if not memories:
             return []
         all_text = " ".join(memories)
@@ -220,7 +220,7 @@ class BilibiliFetcher:
         video_url = video.url
 
         # Get user context
-        memories = self.memory.get_all_key_memories()
+        memories = self.memory.get_all_key_memories(user_id)
         memory_hint = ""
         if memories:
             memory_hint = "你记得关于对方的事：" + "；".join(memories[:5])
