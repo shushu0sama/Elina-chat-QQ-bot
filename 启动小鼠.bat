@@ -1,62 +1,72 @@
 @echo off
-chcp 65001 >nul
-title 小鼠 - QQ Bot
+title Mouse - QQ Bot
+cd /d "D:\code\QQ chat"
 
 echo.
 echo ========================================
-echo      小鼠 QQ Bot 启动中...
+echo     Mouse QQ Bot Launcher
 echo ========================================
 echo.
 
 :: 1. NapCat
-echo [1/2] 启动 NapCat QQ 协议端...
+echo [1/2] Starting NapCat...
 start "NapCat" /min cmd /c "cd /d D:\NapCat\NapCat.Shell.Windows.Node && node.exe ./index.js"
-echo        NapCat 已在后台启动
+echo        NapCat started in background
 echo.
 
 :: 2. Bot
-echo [2/2] 启动小鼠 Bot...
+echo [2/2] Starting Bot...
+start "MouseBot" cmd /c "cd /d D:\code\QQ chat && venv\Scripts\python bot.py"
+echo        Bot window opened
 echo.
-cd /d "D:\code\QQ chat"
-start "小鼠Bot" cmd /c "venv\Scripts\python bot.py"
 
 :: 3. Health check
-echo        等待 Bot 启动中...
-ping -n 5 127.0.0.1 >nul
+echo        Checking if Bot is ready (max 30s)...
 
-set /a tries=0
-:check
-set /a tries+=1
-curl -s -o NUL http://127.0.0.1:18080 2>nul
-if %errorlevel% equ 0 goto success
-if %tries% geq 10 goto fail
-ping -n 2 127.0.0.1 >nul
-goto check
+powershell -NoProfile -Command ^
+"for ($i=0; $i -lt 30; $i++) { ^
+  Start-Sleep 1; ^
+  try { ^
+    Invoke-WebRequest -Uri 'http://127.0.0.1:18080' -TimeoutSec 2 -UseBasicParsing ^| Out-Null; ^
+    exit 0 ^
+  } catch { ^
+    if ($_.Exception.Response -ne $null) { exit 0 } ^
+  } ^
+} ^
+exit 1"
 
-:success
-echo.
-echo ========================================
-echo    [OK] 小鼠已成功启动!
-echo.
-echo    Bot 运行在 127.0.0.1:18080
-echo    NapCat 状态请查看托盘图标
-echo    QQ 里私聊 bot 即可开始对话
-echo ========================================
-echo.
-echo 提示: 关闭此窗口不会停止 Bot.
-echo       Bot 和 NapCat 在独立窗口中运行.
-echo.
-pause
-exit
+if %errorlevel% equ 0 (
+    goto success
+) else (
+    goto fail
+)
 
 :fail
 echo.
 echo ========================================
-echo    [FAIL] 启动超时, 请检查:
-echo    1. .env 中的 API Key 是否正确
-echo    2. 端口 18080 是否被占用
-echo    3. 查看 Bot 窗口的错误日志
+echo    [FAIL] Bot did not start in time.
+echo.
+echo    Please check:
+echo    1. .env API Key is correct
+echo    2. Port 18080 is not in use
+echo    3. Bot window for error messages
 echo ========================================
+echo.
+pause
+exit
+
+:success
+echo.
+echo ========================================
+echo    [OK] Mouse Bot is running!
+echo.
+echo    Bot address: 127.0.0.1:18080
+echo    Check system tray for NapCat icon
+echo    Send a private message in QQ to chat
+echo ========================================
+echo.
+echo    You can close this window safely.
+echo    Bot and NapCat run independently.
 echo.
 pause
 exit
