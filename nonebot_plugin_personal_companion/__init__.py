@@ -14,6 +14,7 @@ from .knowledge import KnowledgeBase, build_knowledge_prompt
 from .flows import FlowManager
 from .content_fetcher import BilibiliFetcher
 from .diary import DiaryWriter
+from .relationship import RelationshipProfiler, build_relationship_prompt
 
 # Lazy-initialized globals — set in _startup()
 plugin_config: Config | None = None
@@ -24,6 +25,7 @@ knowledge_base: KnowledgeBase | None = None
 flow_manager: FlowManager | None = None
 bili_fetcher: BilibiliFetcher | None = None
 diary_writer: DiaryWriter | None = None
+rel_profiler: RelationshipProfiler | None = None
 
 
 async def _is_private_chat(event: Event) -> bool:
@@ -281,6 +283,12 @@ def _build_messages(user_msg: str, retrieved_memories: list[str], user_id: int =
         if kb_prompt:
             messages.append({"role": "system", "content": kb_prompt})
 
+    # System: relationship context (per-user adaptation)
+    if rel_profiler:
+        rel_prompt = build_relationship_prompt(user_id, rel_profiler)
+        if rel_prompt:
+            messages.append({"role": "system", "content": rel_prompt})
+
     # System: personality
     personality_prompt = build_system_prompt(user_id=user_id)
     messages.append({"role": "system", "content": personality_prompt})
@@ -298,7 +306,7 @@ def _build_messages(user_msg: str, retrieved_memories: list[str], user_id: int =
 
 @get_driver().on_startup
 async def _startup():
-    global plugin_config, memory_store, llm, proactive_chat, knowledge_base, flow_manager, bili_fetcher, diary_writer
+    global plugin_config, memory_store, llm, proactive_chat, knowledge_base, flow_manager, bili_fetcher, diary_writer, rel_profiler
 
     # Import scheduler here — NoneBot is initialized by now
     from nonebot import require
@@ -317,6 +325,7 @@ async def _startup():
     flow_manager = FlowManager(llm)
     bili_fetcher = BilibiliFetcher(llm, memory_store, plugin_config)
     diary_writer = DiaryWriter(llm, memory_store, plugin_config)
+    rel_profiler = RelationshipProfiler(memory_store)
 
     # Register proactive chat job
     scheduler.add_job(

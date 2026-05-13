@@ -165,6 +165,23 @@ class MemoryStore:
                 return True
         return False
 
+    def get_user_message_stats(self, user_id: int) -> dict:
+        """Return message count, average length, and first-chat date for a user."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total, AVG(LENGTH(content)) AS avg_len FROM messages WHERE user_id = ? AND role = 'user'",
+                (user_id,),
+            ).fetchone()
+            first = conn.execute(
+                "SELECT first_seen_at FROM active_users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        return {
+            "total": row["total"] or 0,
+            "avg_len": round(row["avg_len"] or 0, 1),
+            "first_seen": first["first_seen_at"] if first else None,
+        }
+
     def get_messages_since(self, when: str, user_id: int, limit: int = 500) -> list[dict]:
         """Get messages for a user since a given ISO timestamp, ordered chronologically."""
         with self._get_conn() as conn:
