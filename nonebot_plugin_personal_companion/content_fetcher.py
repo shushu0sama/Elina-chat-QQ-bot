@@ -197,21 +197,20 @@ class BilibiliFetcher:
     # ── recommendation generation ─────────────────────────────
 
     async def _build_recommendation(self, candidates: list[VideoInfo], user_id: int) -> str | None:
-        """Use LLM to pick the best video and write a natural recommendation."""
+        """Use LLM to write a natural recommendation for the top-matched video. Link is always appended."""
         if not candidates:
             return None
 
-        # Format candidates for LLM
-        video_lines = []
-        for i, v in enumerate(candidates):
-            dur_min = v.duration // 60
-            dur_str = f"{dur_min}分钟" if dur_min > 0 else f"{v.duration}秒"
-            video_lines.append(
-                f"{i+1}. 【{v.category}·{v.author}】{v.title}\n"
-                f"   时长{dur_str}，{v.views}播放·{v.likes}赞\n"
-                f"   简介：{v.desc[:120]}\n"
-                f"   链接：{v.url}"
-            )
+        # Pick the top candidate
+        video = candidates[0]
+        dur_min = video.duration // 60
+        dur_str = f"{dur_min}分钟" if dur_min > 0 else f"{video.duration}秒"
+        video_info = (
+            f"视频：【{video.category}·{video.author}】{video.title}\n"
+            f"时长{dur_str}，{video.views}播放·{video.likes}赞\n"
+            f"简介：{video.desc[:120]}"
+        )
+        video_url = video.url
 
         # Get user context
         memories = self.memory.get_all_key_memories()
@@ -225,24 +224,23 @@ class BilibiliFetcher:
             last_dt = datetime.fromisoformat(last_active)
             gap_h = (datetime.now() - last_dt).total_seconds() / 3600
             if gap_h > 4:
-                gap_hint = f"对方{int(gap_h)}小时没说话了，语气轻松自然，不要用'好久不见'之类的话。"
+                gap_hint = f"对方{int(gap_h)}小时没说话了，语气轻松自然。"
 
         prompt = (
-            "从以下视频中选出最适合推荐给对方的一条，写2-3句话的推荐语。\n"
+            "你要给朋友推荐这个视频，写2-3句话的推荐语。\n"
             "要求：\n"
             "- 自然，像朋友分享，不是营销号\n"
             "- 提一下为什么觉得对方会喜欢（基于你对他的了解）\n"
-            "- 带上视频链接（直接贴，不用改格式）\n"
-            "- 2-4句话，不要太长\n"
-            "- 如果三个都不太合适，选一个相对最好的\n\n"
+            "- 不要写视频链接，链接会自动加上\n"
+            "- 2-4句话，不要太长\n\n"
             f"{memory_hint}\n"
             f"{gap_hint}\n\n"
-            "候选视频：\n" + "\n".join(video_lines)
+            f"{video_info}"
         )
 
         system = (
             "你是小鼠，一个温柔耐心的朋友。你正在给信任的朋友分享你觉得他会喜欢的视频。"
-            "语气自然，不死板，就像深夜和信任的朋友聊天。"
+            "语气自然，不死板。"
         )
 
         try:
@@ -254,13 +252,9 @@ class BilibiliFetcher:
                 max_tokens=384,
             )
             if reply and len(reply) > 10:
-                return reply
+                return f"{reply.strip()}\n\n👉 {video_url}"
         except Exception:
             pass
 
-        # Fallback: simple text with top candidate
-        if candidates:
-            v = candidates[0]
-            return f"刚看到这个视频觉得挺有意思的——{v.title}，分享给你看看 👉 {v.url}"
-
-        return None
+        # Fallback
+        return f"刚看到这个视频觉得挺有意思的——{video.title}，分享给你看看 👉 {video_url}"
