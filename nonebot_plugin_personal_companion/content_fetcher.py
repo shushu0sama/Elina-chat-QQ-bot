@@ -91,6 +91,11 @@ class BilibiliFetcher:
 
         # Match against user interests and push to each user
         for uid in user_ids:
+            # DND: skip if user ignored 3+ consecutive proactive messages
+            ignored = self.memory.count_proactive_since_last_user_message(uid)
+            if ignored >= 3:
+                continue
+
             interests = self._get_user_interests(uid)
             top = self._filter_by_interest(videos, interests, limit=3)
             if not top:

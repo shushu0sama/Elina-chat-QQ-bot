@@ -243,3 +243,17 @@ class MemoryStore:
                 (user_id,),
             ).fetchone()
         return row["sent_at"] if row else None
+
+    def count_proactive_since_last_user_message(self, user_id: int) -> int:
+        """Count proactive messages sent after the user's last message. Used for DND detection."""
+        with self._get_conn() as conn:
+            last_msg = conn.execute(
+                "SELECT last_message_at FROM active_users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if not last_msg or not last_msg["last_message_at"]:
+                return 0
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM proactive_log WHERE user_id = ? AND sent_at > ?",
+                (user_id, last_msg["last_message_at"]),
+            ).fetchone()
+            return row["cnt"]if row else 0

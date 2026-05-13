@@ -41,6 +41,11 @@ class ProactiveChat:
                 await self._send_to_user(user_id)
 
     def _should_send(self, user_id: int, now: datetime) -> bool:
+        # DND: stop if user ignored 3+ consecutive proactive messages
+        ignored = self.memory.count_proactive_since_last_user_message(user_id)
+        if ignored >= 3:
+            return False
+
         # Check cooldown: user must have been silent for COOLDOWN_MINUTES
         last_active = self.memory.get_last_active_time(user_id)
         if last_active:
