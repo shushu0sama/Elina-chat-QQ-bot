@@ -83,8 +83,8 @@ class ProactiveChat:
         if not reply:
             return
 
-        # Record sent time before sending (avoid timing affecting interval)
-        self.memory.record_proactive_sent(user_id)
+        # Record BEFORE sending — interval timing uses this
+        self.memory.record_proactive_sent(user_id, content=reply)
 
         for chunk in LLMClient.chunk_text(reply):
             await bot.send_private_msg(user_id=user_id, message=chunk)
@@ -109,34 +109,67 @@ class ProactiveChat:
         else:
             time_ctx = "现在是晚上。语气柔和一点，关心对方今天的状态和心情。"
 
-        # Get user memories
+        # ── Conversation summaries (high-level view of what was discussed AND resolved) ──
+        summaries = self.memory.get_recent_summaries(user_id, limit=3)
+        summary_block = ""
+        if summaries:
+            summary_block = (
+                "【最近对话摘要——这些话题已经聊过了，不要重复提起：】\n"
+                + "\n---\n".join(f"摘要 {i+1}：{s}" for i, s in enumerate(summaries))
+                + "\n\n请据此判断：如果某个话题在摘要中已被讨论并完结，就不要再提起。"
+            )
+
+        # ── User memories — split by type ──
         memories = self.memory.get_all_key_memories(user_id)
         memory_block = ""
         if memories:
-            memory_block = "你记得关于对方的一些事：\n" + "\n".join(f"- {m}" for m in memories[:10])
+            # Rough split: short factual memories vs longer event-style ones
+            facts = [m for m in memories if len(m) < 30 and not any(
+                kw in m for kw in ["今天", "昨天", "刚", "正在", "最近", "下午", "早上", "晚上"]
+            )]
+            events = [m for m in memories if m not in facts]
 
-        # Recent conversation
-        recent = self.memory.get_recent_messages(limit=10, user_id=user_id)
+            parts = []
+            if facts:
+                parts.append("【关于对方的长期偏好/习惯——可以作为聊天背景：】\n" + "\n".join(f"- {f}" for f in facts[:8]))
+            if events:
+                parts.append("【已发生的事件——这些大多已经完结，除非特别相关否则不要追问：】\n" + "\n".join(f"- {e}" for e in events[:5]))
+            if parts:
+                memory_block = "\n\n".join(parts)
+                memory_block += "\n\n重要：上面的事件是过去式。比如对方说过'吃完了馄饨'，说明这件事已经完结，不要再去问'馄饨吃完了吗'。"
+
+        # ── Recent conversation ──
+        recent = self.memory.get_recent_messages(limit=12, user_id=user_id)
         recent_block = ""
         if recent:
             recent_lines = []
             for m in recent:
                 role_label = "对方" if m["role"] == "user" else "你"
                 recent_lines.append(f"{role_label}: {m['content'][:200]}")
-            recent_block = "最近对话：\n" + "\n".join(recent_lines)
+            recent_block = "【最近聊天记录——了解当前上下文：】\n" + "\n".join(recent_lines)
 
-        # Philosophy knowledge (based on recent context)
+        # ── Proactive history — what the bot already sent proactively ──
+        prev_proactive = self.memory.get_recent_proactive_content(user_id, limit=3)
+        proactive_block = ""
+        if prev_proactive:
+            proactive_block = (
+                "【你最近主动找对方时发的消息——这次绝对不能重复的话题：】\n"
+                + "\n".join(f"- 第{i+1}次: 「{msg[:150]}」" for i, msg in enumerate(prev_proactive))
+                + "\n\n以上话题已经说过了，这次必须换全新的切入点。如果最近一次的主动消息对方没回，"
+                + "说明对方可能不感兴趣，不要再延续那个话题。"
+            )
+
+        # ── Philosophy knowledge ──
         kb_block = ""
         if self.kb and recent:
-            # Use the last user message as retrieval key
             last_user_msgs = [m["content"] for m in recent if m["role"] == "user"]
             if last_user_msgs:
                 kb_block = build_knowledge_prompt(last_user_msgs[-1], self.kb)
 
-        # Personality
+        # ── Personality ──
         persona = build_system_prompt(user_id=user_id)
 
-        # Time since last active
+        # ── Time since last active ──
         last_active = self.memory.get_last_active_time(user_id)
         gap_hint = ""
         if last_active:
@@ -147,7 +180,8 @@ class ProactiveChat:
             elif gap_min >= 60:
                 gap_hint = "对方有一阵子没和你说话了。简单问候就好，不要给对方压力。"
 
-        return "\n".join([
+        # ── Assemble ──
+        return "\n".join(filter(None, [
             "你需要主动给朋友发一条消息。",
             "",
             persona,
@@ -162,11 +196,20 @@ class ProactiveChat:
             "- 不要用'好久不见''好几天没聊了'这类话，除非给出的数据里确实很久没聊",
             "- 绝对不要以'作为XX'开头介绍自己是谁",
             "",
-            kb_block,
+            "【核心规则——务必遵守：】",
+            "- 不要重复你最近主动发过的任何话题（见下方'你最近主动发了什么'）",
+            "- 不要追问已经完结的事件（见下方'已发生的事件'和'对话摘要'）",
+            "- 如果找不到合适的新话题，就分享一个自己的小观察或当下的感受，而不是翻旧话题",
+            "",
+            summary_block,
             "",
             memory_block,
             "",
             recent_block,
             "",
+            proactive_block,
+            "",
+            kb_block,
+            "",
             gap_hint,
-        ]).strip()
+        ])).strip()

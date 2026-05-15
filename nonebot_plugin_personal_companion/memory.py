@@ -52,12 +52,14 @@ class MemoryStore:
                 CREATE TABLE IF NOT EXISTS proactive_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
+                    content TEXT DEFAULT '',
                     sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
             for col, table in [
                 ("user_id", "messages"), ("user_id", "summaries"), ("user_id", "key_memories"),
                 ("importance", "key_memories"), ("access_count", "key_memories"),
+                ("content", "proactive_log"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} INTEGER")
@@ -263,9 +265,30 @@ class MemoryStore:
 
     # ── proactive log ──────────────────────────────────────────
 
-    def record_proactive_sent(self, user_id: int):
+    def record_proactive_sent(self, user_id: int, content: str = ""):
         with self._get_conn() as conn:
-            conn.execute("INSERT INTO proactive_log (user_id) VALUES (?)", (user_id,))
+            conn.execute(
+                "INSERT INTO proactive_log (user_id, content) VALUES (?, ?)",
+                (user_id, content),
+            )
+
+    def get_recent_proactive_content(self, user_id: int, limit: int = 3) -> list[str]:
+        """Return the content of the most recent proactive messages sent to this user."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT content FROM proactive_log WHERE user_id = ? AND content != '' ORDER BY id DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        return [r["content"] for r in rows]
+
+    def get_recent_summaries(self, user_id: int, limit: int = 3) -> list[str]:
+        """Return the most recent conversation summaries for this user."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT summary_text FROM summaries WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        return [r["summary_text"] for r in rows]
 
     def get_last_proactive_time(self, user_id: int) -> str | None:
         with self._get_conn() as conn:
