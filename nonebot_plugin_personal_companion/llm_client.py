@@ -34,6 +34,25 @@ class LLMClient:
 
         return f"我好像连接不上大脑了，稍等一下再试试？({self._error_hint(last_error)})"
 
+    def chat_with_tools(self, messages: list[dict], tools: list[dict],
+                        max_retries: int = 2, max_tokens: int = 1024):
+        """Send a chat request with tool definitions. Returns the raw response
+        so the caller can inspect tool_calls. On failure, returns None."""
+        for attempt in range(max_retries):
+            try:
+                return self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=tools,
+                    temperature=0.8,
+                    max_tokens=max_tokens,
+                )
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    return None
+
     def chat_vision(self, text: str, image_urls: list[str], system_prompt: str = "",
                     max_retries: int = 2, max_tokens: int = 512) -> str:
         """Send a vision request with images. Falls back gracefully on failure."""

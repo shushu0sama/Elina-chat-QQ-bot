@@ -1,3 +1,4 @@
+import json
 import jieba
 from pathlib import Path
 
@@ -15,6 +16,30 @@ from .flows import FlowManager
 from .content_fetcher import BilibiliFetcher
 from .diary import DiaryWriter
 from .relationship import RelationshipProfiler, build_relationship_prompt
+from .web_search import search_web, format_search_results
+
+# Web search tool definition for function calling
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "当你不确定某个事实、需要最新信息、对方询问你知识范围外的问题、"
+            "或想核实某个说法时，使用此工具搜索互联网获取实时信息。"
+            "搜索结果会作为参考信息返回给你，请基于搜索结果用自然的语气回复。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索关键词，提炼对方问题的核心，中英文均可。例如对方问'最近有什么好电影'可以搜索'2026年热门电影推荐'"
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
 
 # Lazy-initialized globals — set in _startup()
 plugin_config: Config | None = None
@@ -209,8 +234,71 @@ async def _process_text_message(user_msg: str, event, bot):
     # 4. Build the full message list for the LLM
     messages = _build_messages(user_msg, retrieved, event.user_id)
 
-    # 5. Call LLM
-    reply = llm.chat(messages)
+    # 5. Call LLM — with function calling if web search is enabled
+    reply = ""
+    if plugin_config and plugin_config.web_search_enabled:
+        try:
+            response = llm.chat_with_tools(messages, tools=[WEB_SEARCH_TOOL])
+
+            if response is None:
+                reply = llm.chat(messages)
+            else:
+                choice = response.choices[0]
+                msg = choice.message
+
+                if msg.tool_calls:
+                    # LLM requested web search — execute and feed results back
+                    assistant_msg = {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                }
+                            }
+                            for tc in msg.tool_calls
+                        ],
+                        "content": msg.content or "",
+                    }
+                    # DeepSeek thinking mode: must pass back reasoning_content
+                    rc = getattr(msg, "reasoning_content", None)
+                    if rc:
+                        assistant_msg["reasoning_content"] = rc
+                    messages.append(assistant_msg)
+
+                    for tc in msg.tool_calls:
+                        if tc.function.name == "web_search":
+                            try:
+                                args = json.loads(tc.function.arguments)
+                                query = args.get("query", user_msg)
+                                results = search_web(query)
+                                formatted = format_search_results(results, query)
+                            except Exception as e:
+                                print(f"[Companion] Search error: {e}")
+                                formatted = f"搜索「{tc.function.arguments}」时出错，请根据已有知识回答。"
+
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": formatted,
+                            })
+
+                    # Second call: generate final response with search results baked in
+                    reply = llm.chat(messages, max_tokens=2048)
+                else:
+                    reply = msg.content or ""
+        except Exception as e:
+            print(f"[Companion] Function calling failed, falling back to regular chat: {e}")
+            reply = llm.chat(messages)
+    else:
+        # Web search disabled — use regular chat
+        reply = llm.chat(messages)
+
+    if not reply:
+        reply = "嗯…我想了一下，不知道该怎么回。换个话题？"
 
     # 6. Save assistant reply
     memory_store.save_message("assistant", reply, event.user_id)
@@ -274,10 +362,15 @@ def _build_messages(user_msg: str, retrieved_memories: list[str], user_id: int =
     global knowledge_base
     messages: list[dict] = []
 
-    # System: injected memories
+    # System: injected memories (max 3, shuffled for variety, lower importance ones may be dropped)
     if retrieved_memories:
+        import random as _random
+        # Shuffle and cap at 3 — prevents the same memories dominating every turn
+        mems = retrieved_memories.copy()
+        _random.shuffle(mems)
+        mems = mems[:3]
         memory_block = "[你记得以下关于用户的信息：]\n"
-        for mem in retrieved_memories:
+        for mem in mems:
             memory_block += f"- {mem}\n"
         messages.append({"role": "system", "content": memory_block})
 
@@ -299,6 +392,11 @@ def _build_messages(user_msg: str, retrieved_memories: list[str], user_id: int =
     if thread_ctx:
         messages.append({"role": "system", "content": thread_ctx})
 
+    # System: anti-repetition — show recent bot replies so model avoids repeating
+    anti_repeat = _build_anti_repeat(recent)
+    if anti_repeat:
+        messages.append({"role": "system", "content": anti_repeat})
+
     # System: personality
     personality_prompt = build_system_prompt(user_id=user_id)
     messages.append({"role": "system", "content": personality_prompt})
@@ -311,6 +409,22 @@ def _build_messages(user_msg: str, retrieved_memories: list[str], user_id: int =
         messages.append({"role": "user", "content": user_msg})
 
     return messages
+
+
+def _build_anti_repeat(recent_messages: list[dict]) -> str:
+    """Build a directive showing the bot's recent replies so it avoids repeating itself."""
+    bot_replies = [m["content"] for m in recent_messages if m["role"] == "assistant"]
+    if len(bot_replies) < 2:
+        return ""
+
+    # Take the last 3-5 bot replies
+    recent_replies = bot_replies[-5:]
+    lines = ["【重要：你最近几轮说过这些话，本次回复必须有所不同——不要重复相同的意思、相同的句式、相同的口头禅：】"]
+    for i, reply in enumerate(recent_replies, 1):
+        snippet = reply[:80].replace("\n", " ")
+        lines.append(f"  {i}. {snippet}...")
+    lines.append("请换个角度、换个语气、换个切入点。如果实在想不出不同的回应，就干脆换个话题。")
+    return "\n".join(lines)
 
 
 def _build_thread_context(recent_messages: list[dict], current_msg: str) -> str:
@@ -379,6 +493,17 @@ async def _startup():
     diary_writer = DiaryWriter(llm, memory_store, plugin_config)
     rel_profiler = RelationshipProfiler(memory_store)
 
+    # Initialize web search backend based on config
+    try:
+        from .web_search import set_backend, BingBackend, DuckDuckGoBackend
+        if plugin_config.web_search_backend == "duckduckgo":
+            set_backend(DuckDuckGoBackend())
+        else:
+            set_backend(BingBackend())
+    except Exception as e:
+        print(f"[Companion] Web search backend init failed: {e}")
+        plugin_config.web_search_enabled = False
+
     # Register proactive chat job
     scheduler.add_job(
         proactive_chat.try_proactive,
@@ -426,3 +551,6 @@ async def _startup():
           f"categories={plugin_config.content_push_bili_categories}, "
           f"max_per_push={plugin_config.content_push_max_per_push}")
     print(f"[Companion] Daily diary: scheduled at 00:00 each day")
+    print(f"[Companion] Web search: enabled={plugin_config.web_search_enabled}, "
+          f"backend={plugin_config.web_search_backend}, "
+          f"max_results={plugin_config.web_search_max_results}")

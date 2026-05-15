@@ -33,6 +33,11 @@ class Config(BaseModel):
     content_push_bili_categories: str = "0,36,188"
     content_push_max_per_push: int = 1
 
+    # Web search
+    web_search_enabled: bool = True
+    web_search_backend: str = "bing"  # bing | duckduckgo
+    web_search_max_results: int = 5
+
     # Bot identity
     bot_nickname: str = "艾琳娜"
 
