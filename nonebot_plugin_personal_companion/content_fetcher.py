@@ -1,14 +1,15 @@
 import random
-import json
 import jieba
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import httpx
+from nonebot.log import logger
 
 from .llm_client import LLMClient
 from .memory import MemoryStore
 from .config import Config
+from .personality import BEIJING_TZ
 
 
 @dataclass
@@ -67,7 +68,8 @@ class BilibiliFetcher:
             return
 
         # Respect active hours (same as proactive chat)
-        hour = datetime.now().hour
+        now_dt = datetime.now(BEIJING_TZ)
+        hour = now_dt.hour
         if not (self.config.proactive_active_hours_start <= hour < self.config.proactive_active_hours_end):
             return
 
@@ -76,7 +78,7 @@ class BilibiliFetcher:
             return
 
         # Check interval per user
-        now = datetime.now().timestamp()
+        now = now_dt.timestamp()
         for uid in user_ids:
             if uid in self._last_push:
                 hours_since = (now - self._last_push[uid]) / 3600
@@ -86,7 +88,7 @@ class BilibiliFetcher:
         # Fetch videos
         videos = await self._fetch_videos()
         if not videos:
-            print("[ContentPush] No videos fetched")
+            logger.info("No videos fetched")
             return
 
         # Match against user interests and push to each user
@@ -111,10 +113,11 @@ class BilibiliFetcher:
                 bot = get_bot()
                 for chunk in LLMClient.chunk_text(msg):
                     await bot.send_private_msg(user_id=uid, message=chunk)
+                self.memory.record_proactive_sent(uid, content=msg)
                 self._last_push[uid] = now
-                print(f"[ContentPush] Sent to user {uid}: {top[0].title[:30]}")
+                logger.info(f"Sent to user {uid}: {top[0].title[:30]}")
             except Exception as e:
-                print(f"[ContentPush] Failed to send: {e}")
+                logger.warning(f"Failed to send: {e}")
 
     # ── fetching ──────────────────────────────────────────────
 
@@ -135,7 +138,7 @@ class BilibiliFetcher:
                         seen.add(v.bvid)
                         all_videos.append(v)
             except Exception as e:
-                print(f"[ContentPush] Failed to fetch rid={rid}: {e}")
+                logger.warning(f"Failed to fetch rid={rid}: {e}")
 
         return all_videos
 
@@ -233,8 +236,8 @@ class BilibiliFetcher:
         last_active = self.memory.get_last_active_time(user_id)
         gap_hint = ""
         if last_active:
-            last_dt = datetime.fromisoformat(last_active)
-            gap_h = (datetime.now() - last_dt).total_seconds() / 3600
+            last_dt = datetime.fromisoformat(last_active).replace(tzinfo=timezone.utc)
+            gap_h = (datetime.now(BEIJING_TZ) - last_dt.astimezone(BEIJING_TZ)).total_seconds() / 3600
             if gap_h > 4:
                 gap_hint = f"对方{int(gap_h)}小时没说话了，语气轻松自然。"
 

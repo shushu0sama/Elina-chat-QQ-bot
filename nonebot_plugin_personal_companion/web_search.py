@@ -2,8 +2,9 @@
 
 import httpx
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from bs4 import BeautifulSoup
+from dataclasses import dataclass
+from typing import cast
+from bs4 import BeautifulSoup, Tag
 
 
 @dataclass
@@ -82,13 +83,14 @@ class BingBackend(SearchBackend):
             results: list[SearchResult] = []
 
             for li in soup.find_all("li", class_="b_algo"):
-                h2 = li.find("h2")
-                a_tag = h2.find("a") if h2 else None
-                title = a_tag.get_text(strip=True) if a_tag else ""
-                url = a_tag.get("href", "") if a_tag else ""
+                li_tag = cast(Tag, li)
+                h2 = li_tag.find("h2")
+                a_tag = cast(Tag, h2).find("a") if h2 else None
+                title = cast(Tag, a_tag).get_text(strip=True) if a_tag else ""
+                url = str(cast(Tag, a_tag).get("href", "")) if a_tag else ""
 
-                caption = li.find("div", class_="b_caption")
-                snippet = caption.get_text(strip=True) if caption else ""
+                caption = li_tag.find("div", class_="b_caption")
+                snippet = cast(Tag, caption).get_text(strip=True) if caption else ""
 
                 if title and url:
                     results.append(SearchResult(title=title, url=url, snippet=snippet))

@@ -1,4 +1,5 @@
 from datetime import datetime
+import random
 
 from .memory import MemoryStore
 
@@ -86,9 +87,13 @@ class RelationshipProfiler:
 
         # Stage-based
         if stage == "new":
-            hints.append("对方刚认识你，保持友好但不过度热情。不要用太随意的口语（比如'笑死''害'）。")
+            hints.append("对方刚认识你，友好、有分寸，不要装熟、撒娇或过度热情。")
+        elif stage == "regular":
+            hints.append("你们已经比较熟了，可以自然放松地接话，但仍然尊重边界。")
+        elif stage == "close":
+            hints.append("你们是好朋友了，可以用短句、轻微玩笑和一点默契，但不要每次都刻意表演亲密。")
         elif stage == "old_friend":
-            hints.append("你们很熟了，可以很随意。偶尔可以说自己状态不好、不想营业。")
+            hints.append("你们很熟了，可以有共同节奏和轻微跑题，偶尔表达自己的状态，但不要把'不想营业'演成固定人设。")
 
         # Style-based
         if style.get("hint"):
@@ -103,7 +108,11 @@ class RelationshipProfiler:
 
 
 def build_relationship_prompt(user_id: int, profiler: RelationshipProfiler) -> str:
-    """Build a short system prompt block describing the relationship context."""
+    """Build a short system prompt block describing the relationship context.
+
+    Includes a rotating 'fresh angle' hint so the bot doesn't fall into the same
+    conversational groove every turn.
+    """
     try:
         profile = profiler.get_profile(user_id)
     except Exception:
@@ -132,5 +141,19 @@ def build_relationship_prompt(user_id: int, profiler: RelationshipProfiler) -> s
 
     if adaptation:
         lines.append(f"- {adaptation}")
+
+    # Rotating fresh angle — pick one at random each turn for variety
+    fresh_angles = [
+        "这次聊天，试试观察对方话语中没说出来的情绪，轻轻点一下。",
+        "这次聊天，如果对方在纠结某事，可以问一个不寻常的问题打破思维惯性。",
+        "这次聊天，可以分享一件你'想到'的小事（编一个也行），不要太严肃。",
+        "这次聊天，试着当一个单纯的倾听者，不需要给建议或总结。",
+        "这次聊天，如果气氛合适，可以开个小玩笑，或者自嘲一下。",
+        "这次聊天，可以表达自己对某件事的真实偏好——喜欢/不喜欢，不要模棱两可。",
+        "这次聊天，关注对方话语中积极的细节，轻轻放大它。",
+        "这次聊天，正常对话就好，不用刻意做什么特别的。",
+    ]
+    angle = random.choice(fresh_angles)
+    lines.append(f"- {angle}")
 
     return "\n".join(lines)

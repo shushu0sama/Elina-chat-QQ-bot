@@ -130,3 +130,39 @@ def build_knowledge_prompt(user_msg: str, kb: KnowledgeBase) -> str:
         lines.append(f"（提示：{guidance}）")
 
     return "\n".join(lines)
+
+
+def build_knowledge_prompt_personalized(user_msg: str, kb: KnowledgeBase,
+                                         user_id: int, memory_store) -> str:
+    """Build a knowledge prompt enriched with the user's own experiences.
+
+    For each matched concept, searches the user's memory for relevant
+    personal experiences, so the bot can say things like '你记不记得你上次...
+    —那其实就是全息图在运作' instead of only quoting the book.
+    """
+    concepts = kb.retrieve(user_msg, limit=2)
+    if not concepts:
+        return ""
+
+    lines = ["[与当前话题相关的核心视角——请自然地融入对话，不要照搬原话：]"]
+    for c in concepts:
+        lines.append(f"- {c['essence']}")
+        for w in c.get("wisdom", []):
+            lines.append(f"  → {w}")
+
+        # Cross-reference with user's personal experiences
+        concept_data = kb._get_concept_by_name(c["name"])
+        if concept_data and memory_store:
+            concept_kws = concept_data.get("keywords", [])[:5]
+            personal = memory_store.retrieve_memories(concept_kws, user_id, limit=2)
+            if personal:
+                lines.append("  【关于这个视角，你记得对方经历过这些——如果自然可以轻轻提起：】")
+                for mem in personal:
+                    lines.append(f"  → 对方经历过：{mem}")
+                lines.append("  如果话题自然相关，可以用'你记不记得你之前...'来关联，但不要强行扯到哲学概念。")
+
+    guidance = kb.get_situation_guidance(user_msg)
+    if guidance:
+        lines.append(f"（提示：{guidance}）")
+
+    return "\n".join(lines)

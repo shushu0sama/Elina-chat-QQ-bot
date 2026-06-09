@@ -114,6 +114,10 @@ money-game-chat-QQ-bot/
 ├── bot.py                                # NoneBot 入口
 ├── .env.example                          # 配置模板
 ├── pyproject.toml                        # 依赖声明
+├── tests/
+│   ├── conftest.py                       # Pytest 配置（NoneBot 初始化）
+│   ├── test_memory.py                    # 记忆系统测试（24 个用例）
+│   └── test_flows.py                     # 流程工具测试（21 个用例）
 ├── nonebot_plugin_personal_companion/
 │   ├── __init__.py                       # 插件主逻辑 + 消息路由
 │   ├── personality.py                    # 人格系统（状态滚动 + prompt 构建）
@@ -125,6 +129,8 @@ money-game-chat-QQ-bot/
 │   ├── content_fetcher.py                # B 站内容拉取 + 兴趣匹配
 │   ├── diary.py                          # 每日日记生成
 │   ├── config.py                         # Pydantic 配置
+│   ├── relationship.py                   # 用户关系画像
+│   ├── web_search.py                     # 联网搜索（Bing / DuckDuckGo）
 │   └── prompts/
 │       ├── default.yaml                  # 人格模板（情绪状态）
 │       ├── philosophy_knowledge.yaml     # 哲学知识库（12 概念）
@@ -217,7 +223,11 @@ process:
 | 存储 | SQLite（WAL 模式，多用户隔离） |
 | 调度 | nonebot-plugin-apscheduler |
 | HTTP | httpx（异步） |
-| 配置 | Pydantic + python-dotenv |
+| 配置 | Pydantic v2 + python-dotenv |
+| 日志 | nonebot.log.logger |
+| 测试 | pytest（45 用例） |
+| 类型检查 | mypy（0 errors） |
+| Lint | ruff（0 issues） |
 
 ## License
 

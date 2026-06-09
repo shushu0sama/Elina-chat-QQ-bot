@@ -16,4 +16,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "nonebot2[websockets]",
+    "pytest>=9.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

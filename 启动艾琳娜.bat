@@ -58,11 +58,24 @@ exit
 :success
 echo.
 echo ========================================
-echo    [OK] Elena Bot is running!
+echo    [OK] Elena Bot System is running!
+echo ========================================
 echo.
-echo    Bot address: 127.0.0.1:18080
-echo    Check system tray for NapCat icon
-echo    Send a private message in QQ to chat
+echo    [Bot] QQ Chat Server
+echo      HTTP API:     http://127.0.0.1:18080
+echo      WebSocket:    ws://127.0.0.1:18080/onebot/v11/ws
+echo      Purpose:      Chat bot service, receives QQ messages, calls AI
+echo.
+echo    [NapCat] QQ Connection Layer
+echo      WebUI:        http://127.0.0.1:6099/webui
+echo      Token:        b5b46d4b8f4f
+echo      Purpose:      Manage QQ login, WebSocket connection config
+echo.
+echo    [Usage]
+echo      1. Open NapCat WebUI to confirm QQ is logged in
+echo      2. Send private message to bot QQ to start chatting
+echo.
+echo    Check system tray for NapCat icon.
 echo ========================================
 echo.
 echo    You can close this window safely.

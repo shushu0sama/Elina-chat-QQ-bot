@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from pathlib import Path
 
 
@@ -41,5 +41,4 @@ class Config(BaseModel):
     # Bot identity
     bot_nickname: str = "艾琳娜"
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")

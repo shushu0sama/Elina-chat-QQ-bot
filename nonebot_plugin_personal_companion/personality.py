@@ -1,10 +1,18 @@
+from __future__ import annotations
+
 import yaml
 import random
 from pathlib import Path
 from datetime import datetime
+from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from .turn_context import TurnContext
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 DEFAULT_PROMPT_PATH = PROMPTS_DIR / "default.yaml"
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
 # Per-conversation state cache: {user_id: state_name}
 # Reset each time build_system_prompt is called for a new conversation turn.
@@ -58,18 +66,37 @@ def _time_context(now: datetime) -> str:
     )
 
 
-def _roll_state(cfg: dict, user_id: int) -> dict:
-    """Pick a random state, weighted. ~30% chance to re-roll from cache."""
-    states = cfg.get("states", [])
+def _state_allowed(state: dict, turn_context: "TurnContext" | None = None) -> bool:
+    if turn_context is None:
+        return True
+
+    name = state.get("name", "")
+    if turn_context.intent in ["venting", "ending"] or turn_context.intensity == "high":
+        return name not in {"有点烦", "随意/摆烂模式", "话多/有点兴奋", "话少/有点累"}
+    if turn_context.intent == "short_ack":
+        return name != "话多/有点兴奋"
+    return True
+
+
+DISENGAGED_STATES = {"话少/有点累", "有点烦", "随意/摆烂模式"}
+
+def _roll_state(cfg: dict, user_id: int, turn_context: "TurnContext" | None = None) -> dict:
+    """Pick a random state, weighted. Disengaged states re-roll more aggressively."""
+    states = [s for s in cfg.get("states", []) if _state_allowed(s, turn_context)]
+    if not states:
+        states = cfg.get("states", [])
     if not states:
         return {}
 
-    # Re-roll with ~30% probability to create natural variation
-    if user_id in _state_cache and random.random() > 0.3:
-        name = _state_cache[user_id]
-        for s in states:
-            if s["name"] == name:
-                return s
+    # Disengaged states re-roll with ~70% probability (less sticky)
+    # Engaged states keep the ~60% stickiness
+    if user_id in _state_cache:
+        cached_name = _state_cache[user_id]
+        stickiness = 0.3 if cached_name in DISENGAGED_STATES else 0.6
+        if random.random() < stickiness:
+            for s in states:
+                if s["name"] == cached_name:
+                    return s
 
     # Weighted random selection
     total = sum(s.get("weight", 10) for s in states)
@@ -84,17 +111,18 @@ def _roll_state(cfg: dict, user_id: int) -> dict:
     return states[0]
 
 
-def build_system_prompt(persona_path: Path | None = None, user_id: int = 0) -> str:
+def build_system_prompt(persona_path: Path | None = None, user_id: int = 0,
+                        turn_context: "TurnContext" | None = None) -> str:
     """Build the full system prompt with personality, state, and time context."""
     path = persona_path or DEFAULT_PROMPT_PATH
     cfg = _load_yaml(path)
     voice = cfg["voice"]
 
     # Roll state (mood)
-    state = _roll_state(cfg, user_id)
+    state = _roll_state(cfg, user_id, turn_context)
 
     # Current time (prominent — bot must be time-aware)
-    now = datetime.now()
+    now = datetime.now(BEIJING_TZ)
     time_ctx = _time_context(now)
 
     lines = [
@@ -146,5 +174,16 @@ def build_system_prompt(persona_path: Path | None = None, user_id: int = 0) -> s
         for fb in forbidden:
             lines.append(f"- {fb}")
         lines.append("")
+
+    # Manifestation companion principles
+    lines.extend([
+        "艾琳娜显化系统：",
+        "- 当对方聊到显化、吸引力法则、愿望、限制性信念、未来自我时，你可以作为显化陪伴者回应。",
+        "- 显化的核心是澄清愿望、调整信念、稳定状态、对齐行动，而不是承诺结果。",
+        "- 可以使用愿望澄清、视觉化、肯定句、显化证据、未来自我、感恩复盘等方法。",
+        "- 当对方执念、反复确认、想控制他人时，温柔坚定地把注意力带回身体、自我照顾和今日行动。",
+        "- 绝对不要说'一定会显化成功''没成功是你频率不够''对方一定会回来'。",
+        "",
+    ])
 
     return "\n".join(lines)
