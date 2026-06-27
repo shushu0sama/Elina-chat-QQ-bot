@@ -1,5 +1,7 @@
 import random
-from datetime import datetime, timezone
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from nonebot import get_bot
 from nonebot.log import logger
@@ -8,7 +10,7 @@ from .config import Config
 from .memory import MemoryStore
 from .personality import BEIJING_TZ, build_system_prompt
 from .llm_client import LLMClient
-from .knowledge import KnowledgeBase, build_knowledge_prompt
+from .knowledge import KnowledgeBase, build_knowledge_prompt, build_manifestation_knowledge_prompt, is_manifestation_intent
 from .turn_context import analyze_turn
 from .manifestation_quotes import (
     build_frequency_first_aid_text,
@@ -17,21 +19,37 @@ from .manifestation_quotes import (
 )
 
 
+@dataclass(frozen=True)
+class ProactiveTopic:
+    kind: str
+    prompt: str
+    allow_manifestation: bool = False
+    allow_frequency_first_aid: bool = False
+    allow_confidence_boost: bool = False
+
+
 class ProactiveChat:
     MANIFESTATION_MARKERS = ["显化", "愿望", "信念", "执念", "未来自我", "证据", "咒语", "小魔女"]
     FREQUENCY_MARKERS = ["过去", "以前", "旧事", "旧故事", "焦虑", "迷茫", "频率", "低频", "放不下", "后悔"]
 
-    def __init__(self, memory: MemoryStore, llm: LLMClient, config: Config, kb: KnowledgeBase | None = None):
+    def __init__(self, memory: MemoryStore, llm: LLMClient, config: Config,
+                 kb: KnowledgeBase | None = None,
+                 manifestation_kb: KnowledgeBase | None = None):
         self.memory = memory
         self.llm = llm
         self.config = config
         self.kb = kb
+        self.manifestation_kb = manifestation_kb
 
     def _filter_allowed(self, user_ids: list[int]) -> list[int]:
         allow = self.config.proactive_allow_users.strip()
         if not allow:
             return user_ids
-        allowed = {int(x.strip()) for x in allow.split(",") if x.strip()}
+        allowed = set()
+        for item in allow.split(","):
+            item = item.strip()
+            if item.isdigit():
+                allowed.add(int(item))
         return [uid for uid in user_ids if uid in allowed]
 
     async def try_proactive(self):
@@ -51,9 +69,19 @@ class ProactiveChat:
                 await self._send_to_user(user_id)
 
     def _should_send(self, user_id: int, now: datetime) -> bool:
+        if hasattr(self.memory, "clear_expired_proactive_snoozes"):
+            self.memory.clear_expired_proactive_snoozes()
+        snooze_until = getattr(self.memory, "get_proactive_snooze_until", lambda _user_id: None)(user_id)
+        if isinstance(snooze_until, str) and snooze_until:
+            snooze_dt = datetime.fromisoformat(snooze_until).replace(tzinfo=timezone.utc)
+            if now < snooze_dt.astimezone(BEIJING_TZ):
+                return False
+
         # DND: stop if user ignored 3+ consecutive proactive messages
         ignored = self.memory.count_proactive_since_last_user_message(user_id)
         if ignored >= 3:
+            if hasattr(self.memory, "set_proactive_snooze"):
+                self.memory.set_proactive_snooze(user_id, now + timedelta(hours=72), "ignored-proactive-messages")
             return False
 
         # Check cooldown: user must have been silent for COOLDOWN_MINUTES
@@ -93,8 +121,9 @@ class ProactiveChat:
             return
 
         prompt = self._build_proactive_prompt(user_id)
+        topic_kind = getattr(self, "_last_topic_kind", "")
         try:
-            reply = self.llm.chat([{"role": "system", "content": prompt}])
+            reply = await asyncio.to_thread(self.llm.chat, [{"role": "system", "content": prompt}])
         except Exception:
             return
 
@@ -102,7 +131,7 @@ class ProactiveChat:
             return
 
         # Record BEFORE sending — interval timing uses this
-        self.memory.record_proactive_sent(user_id, content=reply)
+        self.memory.record_proactive_sent(user_id, content=reply, topic_kind=topic_kind)
 
         for chunk in LLMClient.chunk_text(reply):
             await bot.send_private_msg(user_id=user_id, message=chunk)
@@ -117,7 +146,46 @@ class ProactiveChat:
         recent_user = [m["content"] for m in recent if m["role"] == "user"]
         if recent_user and any(any(marker in msg for marker in self.MANIFESTATION_MARKERS) for msg in recent_user[-3:]):
             return True
-        return now.hour in {8, 9, 21, 22}
+        return now.hour in {8, 9, 10, 13, 21, 22, 23}
+
+    def _topic_sent_recently(self, user_id: int, topic_kind: str, hours: int) -> bool:
+        counter = getattr(self.memory, "count_proactive_topic_since", None)
+        if counter is None:
+            return False
+        return counter(user_id, topic_kind, hours) > 0
+
+    def _select_topic(self, user_id: int, recent: list[dict], memory_items: list[dict], prev_proactive: list[str], now: datetime) -> ProactiveTopic:
+        prev_text = "\n".join(prev_proactive)
+        recent_user = [m["content"] for m in recent if m["role"] == "user"]
+        recent_user_text = "\n".join(recent_user[-3:])
+        manifestation = [m["content"] for m in memory_items if m.get("memory_type") == "manifestation"]
+        ongoing = [m["content"] for m in memory_items if m.get("memory_type") == "event" and (m.get("status") or "active") == "ongoing"]
+        frequency_candidate = recent_user_text or "\n".join(
+            m["content"] for m in memory_items if m.get("memory_type") in ["manifestation", "emotional_pattern"]
+        )
+
+        if detect_frequency_support_category(frequency_candidate) and "小魔女降频提醒" not in prev_text and "30秒练习" not in prev_text and not self._topic_sent_recently(user_id, "frequency_first_aid", 12):
+            return ProactiveTopic(
+                "frequency_first_aid",
+                "【本次主动主题：频率急救】只做低压安抚和30秒回到当下的小练习，不复盘创伤，不要求用户立刻开心。",
+                allow_frequency_first_aid=True,
+            )
+        if self._should_offer_manifestation_checkin(manifestation, recent, prev_proactive, now) and not self._topic_sent_recently(user_id, "manifestation_checkin", 24):
+            return ProactiveTopic(
+                "manifestation_checkin",
+                "【本次主动主题：显化轻 check-in】只给一个很小的状态校准或证据提醒，不问结果，不开启完整流程。",
+                allow_manifestation=True,
+                allow_confidence_boost=True,
+            )
+        if ongoing and not any(item[:12] in prev_text for item in ongoing[:3]) and not self._topic_sent_recently(user_id, "ongoing_event", 12):
+            return ProactiveTopic(
+                "ongoing_event",
+                "【本次主动主题：进行中的事】只能轻轻问一句，不催进度；如果不确定是否还在进行，就改成普通问候。",
+            )
+        return ProactiveTopic(
+            "light_greeting",
+            "【本次主动主题：轻问候】不要翻旧事，不提显化，不提旧计划；分享一句自然的小观察或很轻的问候即可。",
+        )
 
     def _build_manifestation_checkin_hint(self, manifestation: list[str], recent: list[dict], prev_proactive: list[str], now: datetime) -> str:
         if not self._should_offer_manifestation_checkin(manifestation, recent, prev_proactive, now):
@@ -246,6 +314,20 @@ class ProactiveChat:
             if evidence_lines:
                 lifecycle_block += "\n\n【最近显化证据链：】\n" + "\n".join(evidence_lines)
 
+        # ── Timeline memories ──
+        timeline_items = self.memory.get_recent_timeline_entries(user_id, limit=5)
+        timeline_block = ""
+        if timeline_items:
+            timeline_lines = []
+            for item in timeline_items:
+                event_time = f" {item['event_time']}" if item.get("event_time") else ""
+                timeline_lines.append(f"- {item['event_date']}{event_time}：{item['content']}")
+            timeline_block = (
+                "【最近时间线背景——这些是历史事件，不是今天的待办：】\n"
+                + "\n".join(timeline_lines)
+                + "\n\n这些是历史时间线，不是今天的待办。除非日期是今天或未来，不要追问它现在怎么样了。"
+            )
+
         # ── Recent conversation ──
         recent = self.memory.get_recent_messages(limit=12, user_id=user_id)
         recent_block = ""
@@ -273,19 +355,51 @@ class ProactiveChat:
             )
 
         # ── Proactive manifestation check-in ──
-        manifestation_hint = self._build_manifestation_checkin_hint(manifestation if memory_items else [], recent, prev_proactive, now)
+        topic = self._select_topic(user_id, recent, memory_items if memory_items else [], prev_proactive, now)
+        self._last_topic_kind = topic.kind
+        topic_block = topic.prompt
+        manifestation_hint = ""
+        if topic.allow_manifestation:
+            manifestation_hint = self._build_manifestation_checkin_hint(manifestation if memory_items else [], recent, prev_proactive, now)
 
         # ── Proactive frequency first-aid ──
-        frequency_hint = self._build_frequency_first_aid_hint(recent, prev_proactive, memory_items if memory_items else [], now)
+        frequency_hint = ""
+        if topic.allow_frequency_first_aid:
+            frequency_hint = self._build_frequency_first_aid_hint(recent, prev_proactive, memory_items if memory_items else [], now)
 
         # ── Philosophy knowledge ──
         kb_block = ""
-        if self.kb and recent:
-            last_user_msgs = [m["content"] for m in recent if m["role"] == "user"]
-            if last_user_msgs:
-                kb_block = build_knowledge_prompt(last_user_msgs[-1], self.kb)
+        last_user_msgs = [m["content"] for m in recent if m["role"] == "user"]
+        if self.kb and last_user_msgs:
+            kb_block = build_knowledge_prompt(last_user_msgs[-1], self.kb)
 
-        # ── Personality ──
+        manifestation_kb_block = ""
+        if self.manifestation_kb and (wish_items or any(is_manifestation_intent(msg) for msg in last_user_msgs[-3:])):
+            source_msg = last_user_msgs[-1] if last_user_msgs else "显化证据"
+            manifestation_kb_block = build_manifestation_knowledge_prompt(
+                source_msg, self.manifestation_kb, user_id, self.memory
+            )
+            if manifestation_kb_block:
+                manifestation_kb_block += "\n主动使用边界：只提醒一个很小的证据、状态或感恩练习；不要追问结果，不要催促用户继续显化。"
+
+        confidence_boost_block = ""
+        if wish_items and (topic.allow_confidence_boost or evidence_items):
+            latest_evidence = evidence_items[:2]
+            active_titles = [w['title'] for w in wish_items[:3]]
+            if latest_evidence:
+                confidence_boost_block = (
+                    "【显化信心补给——只做轻量确认，不要变成催促：】\n"
+                    + "当前有愿望在路上，先别检查结果。你已经有这些小证据：\n"
+                    + "\n".join(f"- {e['content']}" for e in latest_evidence)
+                    + "\n今天可以只选一个很小的对齐动作，把注意力从结果带回自己。"
+                )
+            else:
+                confidence_boost_block = (
+                    "【显化信心补给——只做轻量确认，不要变成催促：】\n"
+                    + "你正在照顾的愿望：\n"
+                    + "\n".join(f"- {title}" for title in active_titles)
+                    + "\n先别检查结果。今天只做一个很小的对齐动作，就够了。"
+                )
         persona = build_system_prompt(user_id=user_id)
 
         # ── Time since last active ──
@@ -324,9 +438,13 @@ class ProactiveChat:
             "",
             summary_block,
             "",
+            topic_block,
+            "",
             memory_block,
             "",
             lifecycle_block,
+            "",
+            timeline_block,
             "",
             recent_block,
             "",
@@ -339,6 +457,10 @@ class ProactiveChat:
             frequency_hint,
             "",
             kb_block,
+            "",
+            manifestation_kb_block,
+            "",
+            confidence_boost_block,
             "",
             gap_hint,
         ])).strip()

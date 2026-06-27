@@ -1,9 +1,10 @@
 import pytest
 import time
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
-from nonebot_plugin_personal_companion.memory import MemoryStore
+from nonebot_plugin_personal_companion.memory import BEIJING_TZ, MemoryStore
 
 
 @pytest.fixture
@@ -42,8 +43,14 @@ class TestMessages:
 
         recent = store.get_recent_messages(limit=10, user_id=1)
         assert len(recent) == 2
-        assert recent[0] == {"role": "user", "content": "hello"}
-        assert recent[1] == {"role": "assistant", "content": "hi there"}
+        assert recent[0]["role"] == "user"
+        assert recent[0]["content"] == "hello"
+        assert recent[0]["time"] is not None
+        assert recent[0]["time_display"]
+        assert recent[1]["role"] == "assistant"
+        assert recent[1]["content"] == "hi there"
+        assert recent[1]["time"] is not None
+        assert recent[1]["time_display"]
 
     def test_user_isolation(self, store):
         store.save_message("user", "msg from A", user_id=1)
@@ -112,10 +119,26 @@ class TestKeyMemories:
         assert len(result_b) == 1
         assert result_a != result_b
 
-    def test_get_all_key_memories(self, store):
-        store.add_key_memory("m1", user_id=1)
-        store.add_key_memory("m2", user_id=1)
-        assert len(store.get_all_key_memories(user_id=1)) == 2
+    def test_retrieve_skips_stale_generic_memories(self, store):
+        store.add_key_memory("用户最近在准备考试", user_id=1)
+        store.add_key_memory("用户喜欢喝咖啡", user_id=1)
+
+        conn = store._get_conn()
+        conn.execute(
+            "UPDATE key_memories SET created_at = datetime('now', '-7 days') WHERE content = ?",
+            ("用户最近在准备考试",),
+        )
+        conn.execute(
+            "UPDATE key_memories SET created_at = datetime('now', '-1 days') WHERE content = ?",
+            ("用户喜欢喝咖啡",),
+        )
+        conn.commit()
+        conn.close()
+
+        result = store.retrieve_memories(["用户"], user_id=1, limit=10)
+
+        assert "用户喜欢喝咖啡" in result
+        assert "用户最近在准备考试" not in result
 
     def test_has_similar_memory_substring(self, store):
         store.add_key_memory("用户喜欢喝咖啡", user_id=1)
@@ -205,6 +228,20 @@ class TestKeyMemories:
         assert "low importance stale" not in remaining
 
 
+    def test_timeline_invalid_dates_are_ignored(self, store):
+        result = store.maybe_add_timeline_entry_from_message(1, "我6月31日考试好紧张")
+
+        assert result is None
+
+    def test_timeline_history_shows_recent_entries_first(self, store):
+        old_id = store.add_timeline_entry(1, "2026-01-01", "旧事", status="done")
+        new_id = store.add_timeline_entry(1, "2026-06-01", "新事", status="done")
+
+        overview = store.build_timeline_overview(1, mode="history")
+
+        assert overview.index(f"#{new_id}") < overview.index(f"#{old_id}")
+
+
 class TestSummaries:
     def test_save_and_get_summaries(self, store):
         store.save_summary("用户说今天心情不好", 1, 10, user_id=1)
@@ -234,6 +271,8 @@ class TestSummaries:
         end_id = store.get_latest_message_id(user_id=1)
         store.save_summary("summary", start_id, end_id, user_id=1)
 
+        summaries = store.get_recent_summaries(user_id=1, limit=1)
+        assert "历史对话摘要" in summaries[0]
         assert store.message_count_since_last_summary(user_id=1) == 0
 
     def test_extraction_checkpoint_advances(self, store):
@@ -336,12 +375,74 @@ class TestSummaries:
         deleted = store.delete_key_memories(1, "考试")
 
         assert "用户最近在准备考试" in overview
+        assert "正在进行" in overview
+        assert "边界" in overview
         assert ended == ["用户最近在准备考试"]
         assert suppressed == ["用户不想再提offer"]
         assert "用户最近在准备考试" not in active
         assert "用户不想再提offer" not in active
         assert deleted == ["用户最近在准备考试"]
 
+
+class TestTimeline:
+    def test_timeline_entry_persists_after_reopen(self, store):
+        entry_id = store.add_timeline_entry(
+            user_id=1,
+            event_date="2026-04-22",
+            event_time="17:14",
+            content="用户宣布自己已经拥有幸福了",
+            tags=["幸福", "名场面"],
+            importance=3,
+        )
+
+        reopened = MemoryStore(store.db_path)
+        entries = reopened.get_timeline_entries_between(1, "2026-04-22", "2026-04-22")
+
+        assert entry_id > 0
+        assert len(entries) == 1
+        assert entries[0]["event_date"] == "2026-04-22"
+        assert entries[0]["event_time"] == "17:14"
+        assert entries[0]["content"] == "用户宣布自己已经拥有幸福了"
+        assert entries[0]["tags"] == ["幸福", "名场面"]
+
+    def test_timeline_range_is_user_isolated_and_inclusive(self, store):
+        store.add_timeline_entry(1, "2026-04-22", "用户跑步五公里", tags=["跑步"])
+        store.add_timeline_entry(1, "2026-04-23", "用户吃了羊杂粉", tags=["吃"])
+        store.add_timeline_entry(2, "2026-04-22", "另一个用户跑步", tags=["跑步"])
+
+        entries = store.get_timeline_entries_between(1, "2026-04-22", "2026-04-22")
+
+        assert len(entries) == 1
+        assert entries[0]["content"] == "用户跑步五公里"
+
+    def test_retrieve_timeline_entries_by_keyword_and_tags(self, store):
+        store.add_timeline_entry(1, "2026-04-22", "用户宣布自己已经拥有幸福了", tags=["名场面"], importance=3)
+        store.add_timeline_entry(1, "2026-04-23", "用户调试项目报错", tags=["项目"])
+        store.add_timeline_entry(2, "2026-04-22", "另一个用户拥有幸福", tags=["名场面"])
+
+        by_content = store.retrieve_timeline_entries(["幸福"], user_id=1, limit=5)
+        by_tag = store.retrieve_timeline_entries(["项目"], user_id=1, limit=5)
+
+        assert len(by_content) == 1
+        assert by_content[0]["content"] == "用户宣布自己已经拥有幸福了"
+        assert len(by_tag) == 1
+        assert by_tag[0]["content"] == "用户调试项目报错"
+
+    def test_timeline_extraction_freezes_relative_date(self, store):
+        now = datetime(2026, 6, 10, 17, 14, tzinfo=BEIJING_TZ)
+
+        entry_id = store.maybe_add_timeline_entry_from_message(
+            user_id=1,
+            content="昨天跑步五公里，吃了羊杂粉",
+            source_msg_id=42,
+            now=now,
+        )
+        entries = store.get_timeline_entries_between(1, "2026-06-09", "2026-06-09")
+
+        assert entry_id is not None
+        assert len(entries) == 1
+        assert entries[0]["event_date"] == "2026-06-09"
+        assert "昨天跑步五公里" in entries[0]["content"]
 
 class TestActiveUsers:
     def test_record_and_get_active(self, store):
@@ -363,12 +464,15 @@ class TestActiveUsers:
 
 class TestProactiveLog:
     def test_record_and_get(self, store):
-        store.record_proactive_sent(1, content="早安")
-        store.record_proactive_sent(1, content="今天过得怎么样")
+        store.record_proactive_sent(1, content="早安", topic_kind="light_greeting")
+        store.record_proactive_sent(1, content="今天过得怎么样", topic_kind="ongoing_event")
 
         recent = store.get_recent_proactive_content(1, limit=3)
+        topics = store.get_recent_proactive_topics(1, limit=3)
         assert len(recent) == 2
         assert recent[0] == "今天过得怎么样"  # most recent first
+        assert topics == ["ongoing_event", "light_greeting"]
+        assert store.count_proactive_topic_since(1, "ongoing_event", 24) == 1
 
     def test_get_last_proactive_time(self, store):
         assert store.get_last_proactive_time(1) is None

@@ -38,6 +38,19 @@ class Config(BaseModel):
     web_search_backend: str = "bing"  # bing | duckduckgo
     web_search_max_results: int = 5
 
+    # Local QQ reminders
+    reminder_enabled: bool = True
+    reminder_timezone: str = "Asia/Shanghai"
+    reminder_scan_interval_seconds: int = 30
+    reminder_max_due_per_scan: int = 20
+
+    # Feishu calendar
+    feishu_calendar_enabled: bool = False
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_calendar_id: str = ""
+    feishu_timezone: str = "Asia/Shanghai"
+
     # Bot identity
     bot_nickname: str = "艾琳娜"
 

@@ -17,3 +17,12 @@ Key routing rules:
 - Ship/deploy/PR -> invoke /ship or /land-and-deploy
 - Save progress -> invoke /context-save
 - Resume context -> invoke /context-restore
+
+## File reading discipline
+
+- Never manually construct a Read `offset` value. Omit offset entirely, or copy the number directly from a Grep output line number.
+- Read from 0 by default (omit offset). Use `limit` to control how many lines to fetch.
+- For long files, first use Grep to find the target region, then Read with the exact line number from Grep as offset.
+- If Read fails because of an invalid offset, use the reported file length to correct it once; do not retry nearby guessed offsets.
+- Prefer Grep for symbol/content lookup and Read only the small surrounding region needed.
+- For broad codebase exploration requiring multiple searches, use the Explore agent instead of repeated manual reads.

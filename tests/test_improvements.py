@@ -18,18 +18,22 @@ from nonebot_plugin_personal_companion.manifestation_quotes import (  # noqa: E4
     pick_manifestation_quote,
 )
 from nonebot_plugin_personal_companion.knowledge import (  # noqa: E402
+    MANIFESTATION_KNOWLEDGE_PATH,
     KnowledgeBase,
     build_knowledge_prompt_personalized,
+    build_manifestation_knowledge_prompt,
+    is_manifestation_intent,
 )
 from nonebot_plugin_personal_companion import personality  # noqa: E402
 import nonebot_plugin_personal_companion as companion_plugin  # noqa: E402
-from nonebot_plugin_personal_companion.personality import build_system_prompt, _roll_state  # noqa: E402
+from nonebot_plugin_personal_companion.personality import BEIJING_TZ, build_system_prompt, _roll_state  # noqa: E402
 from nonebot_plugin_personal_companion.proactive import ProactiveChat  # noqa: E402
 from nonebot_plugin_personal_companion.relationship import RelationshipProfiler, build_relationship_prompt  # noqa: E402
 from nonebot_plugin_personal_companion.llm_client import LLMClient  # noqa: E402
 from nonebot_plugin_personal_companion.turn_context import (  # noqa: E402
     analyze_turn,
     build_companion_context_prompt,
+    build_reply_mode_prompt,
     choose_reply_max_tokens,
 )
 
@@ -43,6 +47,320 @@ class CompletionChoice:
 class CompletionResponse:
     def __init__(self, content, finish_reason="stop"):
         self.choices = [CompletionChoice(content, finish_reason)]
+
+
+def test_manifestation_knowledge_loads_and_injects_safety_boundaries():
+    kb = KnowledgeBase(MANIFESTATION_KNOWLEDGE_PATH)
+
+    prompt = build_manifestation_knowledge_prompt("我想下一个宇宙订单，但是担心自己不配", kb)
+
+    assert "显化知识视角" in prompt
+    assert "不承诺结果一定发生" in prompt
+    assert "不把未显化归咎于用户频率不够" in prompt
+    assert "愿望说清楚" in prompt or "旧信念" in prompt
+
+
+def test_manifestation_intent_detection_is_selective():
+    assert is_manifestation_intent("为什么还没发生，是不是我频率太低") is True
+    assert is_manifestation_intent("今天午饭吃什么") is False
+
+
+def test_normal_chat_prompt_injects_manifestation_knowledge_only_when_relevant():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    old_config = companion_plugin.plugin_config
+    old_kb = companion_plugin.knowledge_base
+    old_manifest_kb = companion_plugin.manifestation_knowledge_base
+    old_rel = companion_plugin.rel_profiler
+    old_flow = companion_plugin.flow_manager
+    try:
+        companion_plugin.memory_store = store
+        companion_plugin.plugin_config = Mock(max_recent_messages=5)
+        companion_plugin.knowledge_base = None
+        companion_plugin.manifestation_knowledge_base = KnowledgeBase(MANIFESTATION_KNOWLEDGE_PATH)
+        companion_plugin.rel_profiler = None
+        companion_plugin.flow_manager = None
+
+        manifest_messages = companion_plugin._build_messages("我想下一个宇宙订单", [], user_id=1)
+        normal_messages = companion_plugin._build_messages("今天午饭吃什么", [], user_id=1)
+        manifest_content = "\n".join(str(m["content"]) for m in manifest_messages)
+        normal_content = "\n".join(str(m["content"]) for m in normal_messages)
+
+        assert "显化知识视角" in manifest_content
+        assert "不承诺结果一定发生" in manifest_content
+        assert "显化知识视角" not in normal_content
+    finally:
+        companion_plugin.memory_store = old_store
+        companion_plugin.plugin_config = old_config
+        companion_plugin.knowledge_base = old_kb
+        companion_plugin.manifestation_knowledge_base = old_manifest_kb
+        companion_plugin.rel_profiler = old_rel
+        companion_plugin.flow_manager = old_flow
+        cleanup_store(store, db_path)
+
+
+def test_history_messages_do_not_inject_speaker_prefixes():
+    formatted = companion_plugin._format_history_message({"role": "assistant", "content": "我在"})
+
+    assert formatted == {"role": "assistant", "content": "我在"}
+
+
+def test_outgoing_speaker_prefix_is_stripped():
+    assert companion_plugin._strip_outgoing_speaker_prefix("艾琳娜：我在") == "我在"
+    assert companion_plugin._strip_outgoing_speaker_prefix("小鼠: 收到") == "收到"
+    assert companion_plugin._strip_outgoing_speaker_prefix("我在") == "我在"
+
+
+def test_explicit_memory_save_records_assistant_confirmation():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    old_config = companion_plugin.plugin_config
+    old_llm = companion_plugin.llm
+
+    class Event:
+        user_id = 1
+
+    class Bot:
+        async def send(self, event, chunk):
+            pass
+
+    try:
+        companion_plugin.memory_store = store
+        companion_plugin.plugin_config = Mock(auto_extract_interval=999, summary_trigger_count=999)
+        companion_plugin.llm = Mock()
+
+        _run(companion_plugin._process_text_message("记住：我喜欢咖啡", Event(), Bot()))
+
+        recent = store.get_recent_messages(limit=5, user_id=1)
+        assert recent[-1]["role"] == "assistant"
+        assert recent[-1]["content"] == "记住了：我喜欢咖啡"
+    finally:
+        companion_plugin.memory_store = old_store
+        companion_plugin.plugin_config = old_config
+        companion_plugin.llm = old_llm
+        cleanup_store(store, db_path)
+
+
+def test_llm_length_continuation_handles_none_without_crashing():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    old_config = companion_plugin.plugin_config
+    old_llm = companion_plugin.llm
+    old_flow = companion_plugin.flow_manager
+    old_kb = companion_plugin.knowledge_base
+    old_manifest_kb = companion_plugin.manifestation_knowledge_base
+    old_rel = companion_plugin.rel_profiler
+    old_feishu = companion_plugin.feishu_calendar_client
+
+    class Event:
+        user_id = 1
+
+    class Bot:
+        async def send(self, event, chunk):
+            pass
+
+    class Choice:
+        finish_reason = "length"
+        message = Mock(content="前半段", tool_calls=None)
+
+    class Response:
+        choices = [Choice()]
+
+    llm = Mock()
+    llm.chat_with_tools.return_value = Response()
+    llm.chat.return_value = None
+    llm.complete_if_needed.side_effect = lambda messages, reply, max_tokens=256: reply
+
+    try:
+        companion_plugin.memory_store = store
+        companion_plugin.plugin_config = Mock(
+            max_recent_messages=5,
+            web_search_enabled=True,
+            auto_extract_interval=999,
+            summary_trigger_count=999,
+        )
+        companion_plugin.llm = llm
+        companion_plugin.flow_manager = None
+        companion_plugin.knowledge_base = None
+        companion_plugin.manifestation_knowledge_base = None
+        companion_plugin.rel_profiler = None
+        companion_plugin.feishu_calendar_client = None
+
+        _run(companion_plugin._process_text_message("查一下最近新闻", Event(), Bot()))
+
+        recent = store.get_recent_messages(limit=5, user_id=1)
+        assert recent[-1]["role"] == "assistant"
+        assert recent[-1]["content"] == "前半段"
+    finally:
+        companion_plugin.memory_store = old_store
+        companion_plugin.plugin_config = old_config
+        companion_plugin.llm = old_llm
+        companion_plugin.flow_manager = old_flow
+        companion_plugin.knowledge_base = old_kb
+        companion_plugin.manifestation_knowledge_base = old_manifest_kb
+        companion_plugin.rel_profiler = old_rel
+        companion_plugin.feishu_calendar_client = old_feishu
+        cleanup_store(store, db_path)
+
+
+def test_weak_calendar_intent_asks_confirmation_without_creating_event():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    old_config = companion_plugin.plugin_config
+    old_llm = companion_plugin.llm
+    old_flow = companion_plugin.flow_manager
+    old_kb = companion_plugin.knowledge_base
+    old_manifest_kb = companion_plugin.manifestation_knowledge_base
+    old_rel = companion_plugin.rel_profiler
+    old_feishu = companion_plugin.feishu_calendar_client
+
+    class Event:
+        user_id = 1
+
+    class Bot:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, event, chunk):
+            self.sent.append(chunk)
+
+    feishu = Mock()
+    try:
+        companion_plugin.memory_store = store
+        companion_plugin.plugin_config = Mock(
+            max_recent_messages=5,
+            web_search_enabled=False,
+            auto_extract_interval=999,
+            summary_trigger_count=999,
+            feishu_timezone="Asia/Shanghai",
+        )
+        companion_plugin.llm = Mock()
+        companion_plugin.flow_manager = None
+        companion_plugin.knowledge_base = None
+        companion_plugin.manifestation_knowledge_base = None
+        companion_plugin.rel_profiler = None
+        companion_plugin.feishu_calendar_client = feishu
+        bot = Bot()
+
+        _run(companion_plugin._process_text_message("明天下午三点开会，好烦", Event(), bot))
+
+        feishu.create_event_from_request.assert_not_called()
+        assert "你是想让我帮你记到日历里" in bot.sent[-1]
+    finally:
+        companion_plugin.memory_store = old_store
+        companion_plugin.plugin_config = old_config
+        companion_plugin.llm = old_llm
+        companion_plugin.flow_manager = old_flow
+        companion_plugin.knowledge_base = old_kb
+        companion_plugin.manifestation_knowledge_base = old_manifest_kb
+        companion_plugin.rel_profiler = old_rel
+        companion_plugin.feishu_calendar_client = old_feishu
+        cleanup_store(store, db_path)
+
+
+def test_feishu_create_error_reply_hides_internal_exception():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    old_config = companion_plugin.plugin_config
+    old_llm = companion_plugin.llm
+    old_flow = companion_plugin.flow_manager
+    old_kb = companion_plugin.knowledge_base
+    old_manifest_kb = companion_plugin.manifestation_knowledge_base
+    old_rel = companion_plugin.rel_profiler
+    old_feishu = companion_plugin.feishu_calendar_client
+
+    class Event:
+        user_id = 1
+
+    class Bot:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, event, chunk):
+            self.sent.append(chunk)
+
+    feishu = Mock()
+    feishu.create_event_from_request.side_effect = RuntimeError("tenant_access_token invalid secret")
+    try:
+        companion_plugin.memory_store = store
+        companion_plugin.plugin_config = Mock(
+            max_recent_messages=5,
+            web_search_enabled=False,
+            auto_extract_interval=999,
+            summary_trigger_count=999,
+            feishu_timezone="Asia/Shanghai",
+        )
+        companion_plugin.llm = Mock()
+        companion_plugin.flow_manager = None
+        companion_plugin.knowledge_base = None
+        companion_plugin.manifestation_knowledge_base = None
+        companion_plugin.rel_profiler = None
+        companion_plugin.feishu_calendar_client = feishu
+        bot = Bot()
+
+        _run(companion_plugin._process_text_message("提醒我明天下午三点开会", Event(), bot))
+
+        assert "创建失败" in bot.sent[-1]
+        assert "tenant_access_token" not in bot.sent[-1]
+        assert "invalid secret" not in bot.sent[-1]
+    finally:
+        companion_plugin.memory_store = old_store
+        companion_plugin.plugin_config = old_config
+        companion_plugin.llm = old_llm
+        companion_plugin.flow_manager = old_flow
+        companion_plugin.knowledge_base = old_kb
+        companion_plugin.manifestation_knowledge_base = old_manifest_kb
+        companion_plugin.rel_profiler = old_rel
+        companion_plugin.feishu_calendar_client = old_feishu
+        cleanup_store(store, db_path)
+
+
+def test_user_ending_message_snoozes_proactive_chat():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    old_config = companion_plugin.plugin_config
+    old_llm = companion_plugin.llm
+    old_flow = companion_plugin.flow_manager
+    old_kb = companion_plugin.knowledge_base
+    old_manifest_kb = companion_plugin.manifestation_knowledge_base
+    old_rel = companion_plugin.rel_profiler
+    old_feishu = companion_plugin.feishu_calendar_client
+
+    class Event:
+        user_id = 1
+
+    class Bot:
+        async def send(self, event, chunk):
+            pass
+
+    try:
+        companion_plugin.memory_store = store
+        companion_plugin.plugin_config = Mock(
+            max_recent_messages=5,
+            web_search_enabled=False,
+            auto_extract_interval=999,
+            summary_trigger_count=999,
+        )
+        companion_plugin.llm = Mock(chat=Mock(return_value="晚安，好好休息。"), complete_if_needed=Mock(side_effect=lambda messages, reply, max_tokens=256: reply))
+        companion_plugin.flow_manager = None
+        companion_plugin.knowledge_base = None
+        companion_plugin.manifestation_knowledge_base = None
+        companion_plugin.rel_profiler = None
+        companion_plugin.feishu_calendar_client = None
+
+        _run(companion_plugin._process_text_message("我睡了晚安", Event(), Bot()))
+
+        assert store.get_proactive_snooze_until(1) is not None
+    finally:
+        companion_plugin.memory_store = old_store
+        companion_plugin.plugin_config = old_config
+        companion_plugin.llm = old_llm
+        companion_plugin.flow_manager = old_flow
+        companion_plugin.knowledge_base = old_kb
+        companion_plugin.manifestation_knowledge_base = old_manifest_kb
+        companion_plugin.rel_profiler = old_rel
+        companion_plugin.feishu_calendar_client = old_feishu
+        cleanup_store(store, db_path)
 
 
 # ── Helpers ────────────────────────────────────────────────────
@@ -183,13 +501,27 @@ def test_memory_management_command_routes():
         overview = companion_plugin._handle_memory_management_command("我的记忆", 1)
         ended = companion_plugin._handle_memory_management_command("这件事结束了：考试", 1)
         suppressed = companion_plugin._handle_memory_management_command("以后别再提：offer", 1)
+        boundary = companion_plugin._handle_memory_management_command("以后晚上别提醒我任务", 1)
+        preference = companion_plugin._handle_memory_management_command("我希望你回复短一点", 1)
+        pause = companion_plugin._handle_memory_management_command("暂停主动关心", 1)
+        resume = companion_plugin._handle_memory_management_command("恢复主动关心", 1)
         active = store.get_all_key_memories(user_id=1)
+        memories = store.get_key_memories_with_meta(1)
+        by_content = {m["content"]: m for m in memories}
 
         assert overview is not None and "准备考试" in overview
+        assert "正在进行" in overview
         assert ended is not None and "已标记为已结束" in ended
         assert suppressed is not None and "不再主动提起" in suppressed
+        assert boundary is not None and "记住这个边界" in boundary
+        assert preference is not None and "记住这个偏好" in preference
+        assert pause is not None and "暂停主动关心" in pause
+        assert resume is not None and "恢复主动关心" in resume
         assert "用户最近在准备考试" not in active
         assert "用户已经拿到offer了" not in active
+        assert by_content["用户不希望晚上别提醒我任务"]["memory_type"] == "boundary"
+        assert by_content["用户希望我回复短一点"]["memory_type"] == "preference"
+        assert store.get_proactive_snooze_until(1) is None
     finally:
         companion_plugin.memory_store = old_store
         cleanup_store(store, db_path)
@@ -325,9 +657,10 @@ def test_system_prompt_uses_beijing_time():
     with patch.object(personality, "datetime", FixedDateTime):
         prompt = build_system_prompt(user_id=1)
 
-    assert "北京时间 21:05" in prompt
+    assert "北京时间 2026年06月02日（2026-06-02）21:05" in prompt
     assert "周二晚上" in prompt
-    assert "北京时间 13:05" not in prompt
+    assert "历史聊天、摘要、记忆、日记里的日期都只是过去发生时间" in prompt
+    assert "北京时间 2026年06月02日（2026-06-02）13:05" not in prompt
 
 
 def test_proactive_prompt_uses_beijing_time_for_time_context():
@@ -341,12 +674,13 @@ def test_proactive_prompt_uses_beijing_time_for_time_context():
     memory.get_last_active_time.return_value = None
     memory.get_manifestation_wishes.return_value = []
     memory.get_manifestation_evidence.return_value = []
+    memory.get_recent_timeline_entries.return_value = []
     chat = ProactiveChat(memory, Mock(), Mock(), kb=None)
     with patch("nonebot_plugin_personal_companion.proactive.datetime", FixedDateTime), \
          patch("nonebot_plugin_personal_companion.personality.datetime", FixedDateTime):
         prompt = chat._build_proactive_prompt(user_id=1)
 
-    assert "北京时间 21:05" in prompt
+    assert "北京时间 2026年06月02日（2026-06-02）21:05" in prompt
     assert "现在是晚上" in prompt
     assert "现在是午后" not in prompt
 
@@ -361,6 +695,7 @@ def test_companion_context_receives_distress_before_solutions():
     ctx = build_companion_context_prompt(turn)
 
     assert turn.intent == "venting"
+    assert turn.reply_mode == "comfort"
     assert turn.intensity == "high"
     assert turn.reply_length == "supportive"
     assert turn.flow_invite == "process"
@@ -380,6 +715,7 @@ def test_companion_context_celebrates_good_news():
     ctx = build_companion_context_prompt(turn)
 
     assert turn.intent == "celebrating"
+    assert turn.reply_mode == "celebration"
     assert turn.flow_invite == "appreciation"
 
     assert "分享好事" in ctx
@@ -392,6 +728,7 @@ def test_companion_context_short_ack_allows_short_reply():
     ctx = build_companion_context_prompt(turn)
 
     assert turn.intent == "short_ack"
+    assert turn.reply_mode == "short_ack"
 
     assert "很短的回应" in ctx
     assert "只接一句" in ctx
@@ -422,6 +759,7 @@ def test_proactive_prompt_emphasizes_novelty_and_low_pressure():
     memory.get_last_active_time.return_value = None
     memory.get_manifestation_wishes.return_value = []
     memory.get_manifestation_evidence.return_value = []
+    memory.get_recent_timeline_entries.return_value = []
     chat = ProactiveChat(memory, Mock(), Mock(), kb=None)
 
     prompt = chat._build_proactive_prompt(user_id=1)
@@ -445,7 +783,58 @@ def test_relationship_prompt_new_user_stays_bounded():
         cleanup_store(store, db_path)
 
 
-def test_reply_max_tokens_short_and_factual_profiles():
+def test_reply_mode_prompts_shape_response_strategy():
+    short = analyze_turn("嗯", [])
+    comfort = analyze_turn("我好焦虑，感觉什么都做不好", [])
+    celebration = analyze_turn("我成功了！", [])
+    practical = analyze_turn("这个报错怎么修", [])
+    soft_end = analyze_turn("睡了晚安", [])
+
+    assert short.reply_mode == "short_ack"
+    assert "不要连续提问" in build_reply_mode_prompt(short)
+    assert comfort.reply_mode == "comfort"
+    assert "先共情" in build_reply_mode_prompt(comfort)
+    assert celebration.reply_mode == "celebration"
+    assert "不要说教" in build_reply_mode_prompt(celebration)
+    assert practical.reply_mode == "practical"
+    assert "先给结论" in build_reply_mode_prompt(practical)
+    assert soft_end.reply_mode == "soft_end"
+    assert "不要追问" in build_reply_mode_prompt(soft_end)
+
+
+def test_build_messages_injects_reply_mode_before_companion_context():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    old_config = companion_plugin.plugin_config
+    old_kb = companion_plugin.knowledge_base
+    old_manifest_kb = companion_plugin.manifestation_knowledge_base
+    old_rel = companion_plugin.rel_profiler
+    old_flow = companion_plugin.flow_manager
+    try:
+        companion_plugin.memory_store = store
+        companion_plugin.plugin_config = Mock(max_recent_messages=5)
+        companion_plugin.knowledge_base = None
+        companion_plugin.manifestation_knowledge_base = None
+        companion_plugin.rel_profiler = None
+        companion_plugin.flow_manager = None
+
+        messages = companion_plugin._build_messages("我好焦虑", [], user_id=1)
+        contents = [m["content"] for m in messages if m["role"] == "system"]
+        reply_mode_index = next(i for i, content in enumerate(contents) if "[本轮回复模式：]" in content)
+        companion_index = next(i for i, content in enumerate(contents) if "[本轮陪伴方式：]" in content)
+
+        assert reply_mode_index < companion_index
+        assert "模式：comfort" in contents[reply_mode_index]
+    finally:
+        companion_plugin.memory_store = old_store
+        companion_plugin.plugin_config = old_config
+        companion_plugin.knowledge_base = old_kb
+        companion_plugin.manifestation_knowledge_base = old_manifest_kb
+        companion_plugin.rel_profiler = old_rel
+        companion_plugin.flow_manager = old_flow
+        cleanup_store(store, db_path)
+
+
     assert choose_reply_max_tokens(analyze_turn("嗯嗯", [])) == 2048
     assert choose_reply_max_tokens(analyze_turn("睡了晚安", [])) == 2048
     assert choose_reply_max_tokens(analyze_turn("这段代码为什么报错，帮我解释一下", [])) == 2048
@@ -496,7 +885,55 @@ def test_persona_state_allows_casual_variety():
     assert state["name"] == "随意/摆烂模式"
 
 
-def test_proactive_prompt_groups_memory_by_status():
+def test_proactive_topic_selector_uses_light_greeting_by_default():
+    store, db_path = make_store()
+    try:
+        store.add_key_memory("用户喜欢喝咖啡", user_id=1)
+        store.record_user_active(1)
+        chat = ProactiveChat(store, Mock(), Mock(), kb=None)
+
+        prompt = chat._build_proactive_prompt(user_id=1)
+
+        assert "本次主动主题：轻问候" in prompt
+        assert "不提显化" in prompt
+    finally:
+        cleanup_store(store, db_path)
+
+
+def test_proactive_topic_selector_limits_manifestation_after_recent_checkin():
+    store, db_path = make_store()
+    try:
+        store.create_manifestation_wish(1, "稳定关系", "我想显化稳定关系")
+        store.add_key_memory("用户正在练习稳定关系", user_id=1, memory_type="manifestation")
+        store.save_message("user", "我想做显化日记", user_id=1)
+        store.record_proactive_sent(1, "今晚要不要收集一个小小的显化证据？")
+        store.record_user_active(1)
+        chat = ProactiveChat(store, Mock(), Mock(), kb=None)
+
+        prompt = chat._build_proactive_prompt(user_id=1)
+
+        assert "本次主动主题：显化轻 check-in" not in prompt
+        assert "本次主动主题：轻问候" in prompt
+        assert "显化信心补给" not in prompt
+    finally:
+        cleanup_store(store, db_path)
+
+
+def test_proactive_topic_selector_allows_frequency_first_aid_for_recent_anxiety():
+    store, db_path = make_store()
+    try:
+        store.save_message("user", "我又被过去的事情拉住了，好焦虑", user_id=1)
+        store.record_user_active(1)
+        chat = ProactiveChat(store, Mock(), Mock(), kb=None)
+
+        prompt = chat._build_proactive_prompt(user_id=1)
+
+        assert "本次主动主题：频率急救" in prompt
+        assert "可选频率急救包" in prompt
+    finally:
+        cleanup_store(store, db_path)
+
+
     store, db_path = make_store()
     try:
         store.add_key_memory("用户喜欢喝咖啡", user_id=1)
@@ -522,6 +959,43 @@ def test_proactive_prompt_groups_memory_by_status():
         assert "已完成和已过期的旧事已隐藏" in prompt
         assert "时间已经过期的旧计划" in prompt
         assert "准备周四出去玩" not in prompt
+    finally:
+        cleanup_store(store, db_path)
+
+
+def test_proactive_topic_budget_blocks_recent_manifestation_checkin():
+    store, db_path = make_store()
+    try:
+        store.save_manifestation_entry(1, "manifest_seed", "用户想显化稳定关系")
+        store.save_message("user", "我想做显化日记", user_id=1)
+        store.record_proactive_sent(1, "显化轻 check-in", topic_kind="manifestation_checkin")
+        store.record_user_active(1)
+        chat = ProactiveChat(store, Mock(), Mock(), kb=None)
+
+        prompt = chat._build_proactive_prompt(user_id=1)
+
+        assert "本次主动主题：显化轻 check-in" not in prompt
+        assert "可选显化关心" not in prompt
+    finally:
+        cleanup_store(store, db_path)
+
+
+def test_proactive_ignored_messages_create_quiet_period():
+    store, db_path = make_store()
+    try:
+        store.record_user_active(1)
+        conn = store._get_conn()
+        conn.execute("UPDATE active_users SET last_message_at = datetime('now', '-1 hour') WHERE user_id = ?", (1,))
+        conn.commit()
+        conn.close()
+        store.record_proactive_sent(1, "第一条", topic_kind="light_greeting")
+        store.record_proactive_sent(1, "第二条", topic_kind="light_greeting")
+        store.record_proactive_sent(1, "第三条", topic_kind="light_greeting")
+        config = Mock(proactive_cooldown_minutes=0, proactive_interval_minutes=0)
+        chat = ProactiveChat(store, Mock(), config, kb=None)
+
+        assert chat._should_send(1, datetime.now(BEIJING_TZ)) is False
+        assert store.get_proactive_snooze_until(1) is not None
     finally:
         cleanup_store(store, db_path)
 
@@ -602,6 +1076,238 @@ def test_normal_chat_prompt_excludes_completed_and_expired_memory():
         companion_plugin.knowledge_base = old_kb
         companion_plugin.rel_profiler = old_rel
         companion_plugin.flow_manager = old_flow
+        cleanup_store(store, db_path)
+
+def test_normal_chat_prompt_does_not_echo_history_timestamps():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    old_config = companion_plugin.plugin_config
+    old_kb = companion_plugin.knowledge_base
+    old_rel = companion_plugin.rel_profiler
+    old_flow = companion_plugin.flow_manager
+    try:
+        companion_plugin.memory_store = store
+        companion_plugin.plugin_config = Mock(max_recent_messages=5)
+        companion_plugin.knowledge_base = None
+        companion_plugin.rel_profiler = None
+        companion_plugin.flow_manager = None
+        store.save_message("user", "我那天说自己拥有幸福了", user_id=1)
+        conn = store._get_conn()
+        conn.execute(
+            "UPDATE messages SET created_at = ? WHERE content = ?",
+            ("2026-04-22 09:14:00", "我那天说自己拥有幸福了"),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch.object(companion_plugin, "datetime", FixedDateTime):
+            messages = companion_plugin._build_messages("现在几点", [], user_id=1)
+        content = "\n".join(str(m["content"]) for m in messages)
+
+        assert "最近聊天记录只作为历史上下文" in content
+        assert "[2026-04-22 17:14 北京时间]" not in content
+        assert "时间戳" not in content
+        assert messages[-1] == {"role": "user", "content": "现在几点"}
+    finally:
+        companion_plugin.memory_store = old_store
+        companion_plugin.plugin_config = old_config
+        companion_plugin.knowledge_base = old_kb
+        companion_plugin.rel_profiler = old_rel
+        companion_plugin.flow_manager = old_flow
+        cleanup_store(store, db_path)
+
+
+def test_timeline_retrieval_uses_explicit_date_even_without_keyword_match():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    try:
+        companion_plugin.memory_store = store
+        store.add_timeline_entry(1, "2026-04-22", "用户宣布自己已经拥有幸福了", event_time="17:14")
+
+        entries = companion_plugin._retrieve_timeline_for_turn("4月22日发生了什么", ["发生", "什么"], user_id=1)
+
+        assert len(entries) == 1
+        assert entries[0]["event_date"] == "2026-04-22"
+        assert entries[0]["content"] == "用户宣布自己已经拥有幸福了"
+    finally:
+        companion_plugin.memory_store = old_store
+        cleanup_store(store, db_path)
+
+
+def test_handle_date_time_question_returns_deterministic_answer():
+    from nonebot_plugin_personal_companion import BEIJING_TZ
+    now = datetime(2026, 6, 12, 12, 24, tzinfo=BEIJING_TZ)
+
+    reply = companion_plugin._handle_date_time_question("今天几号", now)
+    assert reply is not None
+    assert "6月12日" in reply
+
+    reply = companion_plugin._handle_date_time_question("现在几点", now)
+    assert reply is not None
+    assert "12点24分" in reply
+
+    reply = companion_plugin._handle_date_time_question("星期几", now)
+    assert reply is not None
+    assert "星期五" in reply
+
+    reply = companion_plugin._handle_date_time_question("今天天气怎么样", now)
+    assert reply is None
+
+
+def test_time_lock_appears_at_end_of_built_messages():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    old_config = companion_plugin.plugin_config
+    old_kb = companion_plugin.knowledge_base
+    old_rel = companion_plugin.rel_profiler
+    old_flow = companion_plugin.flow_manager
+    try:
+        companion_plugin.memory_store = store
+        companion_plugin.plugin_config = Mock(max_recent_messages=3)
+        companion_plugin.knowledge_base = None
+        companion_plugin.rel_profiler = None
+        companion_plugin.flow_manager = None
+
+        with patch.object(companion_plugin, "datetime", FixedDateTime):
+            messages = companion_plugin._build_messages("你好", [], user_id=1)
+        system_contents = [m["content"] for m in messages if m["role"] == "system"]
+
+        assert any("当前真实时间校验" in c for c in system_contents)
+        assert any("历史消息、记忆、摘要、日记" in c for c in system_contents)
+
+        last_system = system_contents[-1]
+        assert "当前真实时间校验" in last_system
+    finally:
+        companion_plugin.memory_store = old_store
+        companion_plugin.plugin_config = old_config
+        companion_plugin.knowledge_base = old_kb
+        companion_plugin.rel_profiler = old_rel
+        companion_plugin.flow_manager = old_flow
+        cleanup_store(store, db_path)
+
+
+def test_time_lock_not_confused_by_old_date_in_history():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    old_config = companion_plugin.plugin_config
+    old_kb = companion_plugin.knowledge_base
+    old_rel = companion_plugin.rel_profiler
+    old_flow = companion_plugin.flow_manager
+    try:
+        companion_plugin.memory_store = store
+        companion_plugin.plugin_config = Mock(max_recent_messages=8)
+        companion_plugin.knowledge_base = None
+        companion_plugin.rel_profiler = None
+        companion_plugin.flow_manager = None
+
+        store.save_message("user", "今天是2月14号，情人节快乐", user_id=1)
+        conn = store._get_conn()
+        conn.execute(
+            "UPDATE messages SET created_at = ? WHERE content = ?",
+            ("2026-02-14 09:00:00", "今天是2月14号，情人节快乐"),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch.object(companion_plugin, "datetime", FixedDateTime):
+            messages = companion_plugin._build_messages("今天几号", [], user_id=1)
+        system_contents = [m["content"] for m in messages if m["role"] == "system"]
+
+        time_lock = [c for c in system_contents if "当前真实时间校验" in c][0]
+        assert "2026年06月02日" in time_lock or "2026-06-02" in time_lock
+    finally:
+        companion_plugin.memory_store = old_store
+        companion_plugin.plugin_config = old_config
+        companion_plugin.knowledge_base = old_kb
+        companion_plugin.rel_profiler = old_rel
+        companion_plugin.flow_manager = old_flow
+        cleanup_store(store, db_path)
+
+
+def test_normal_chat_prompt_injects_timeline_entries_with_date_safety():
+    store, db_path = make_store()
+    old_store = companion_plugin.memory_store
+    old_config = companion_plugin.plugin_config
+    old_kb = companion_plugin.knowledge_base
+    old_rel = companion_plugin.rel_profiler
+    old_flow = companion_plugin.flow_manager
+    try:
+        companion_plugin.memory_store = store
+        companion_plugin.plugin_config = Mock(max_recent_messages=5)
+        companion_plugin.knowledge_base = None
+        companion_plugin.rel_profiler = None
+        companion_plugin.flow_manager = None
+        timeline_entries = [{
+            "event_date": "2026-04-22",
+            "event_time": "17:14",
+            "content": "用户宣布自己已经拥有幸福了",
+        }]
+
+        messages = companion_plugin._build_messages("幸福名场面", [], user_id=1, timeline_entries=timeline_entries)
+        content = "\n".join(str(m["content"]) for m in messages)
+
+        assert "时间线记忆" in content
+        assert "日期是事件发生日期，不代表今天" in content
+        assert "2026-04-22 17:14：用户宣布自己已经拥有幸福了" in content
+    finally:
+        companion_plugin.memory_store = old_store
+        companion_plugin.plugin_config = old_config
+        companion_plugin.knowledge_base = old_kb
+        companion_plugin.rel_profiler = old_rel
+        companion_plugin.flow_manager = old_flow
+        cleanup_store(store, db_path)
+
+
+def test_proactive_prompt_includes_timeline_as_background_only():
+    store, db_path = make_store()
+    try:
+        store.add_timeline_entry(1, "2026-04-22", "用户宣布自己已经拥有幸福了", event_time="17:14")
+        config = Mock()
+        chat = ProactiveChat(store, Mock(), config, kb=None)
+
+        prompt = chat._build_proactive_prompt(user_id=1)
+
+        assert "最近时间线背景" in prompt
+        assert "2026-04-22 17:14：用户宣布自己已经拥有幸福了" in prompt
+        assert "这些是历史时间线，不是今天的待办" in prompt
+    finally:
+        cleanup_store(store, db_path)
+
+
+def test_proactive_manifestation_checkin_can_boost_confidence():
+    store, db_path = make_store()
+    try:
+        wish_id = store.create_manifestation_wish(1, "更稳定的工作", "我想显化更稳定的工作")
+        store.add_manifestation_evidence(1, "我今天没有反复确认", wish_id=wish_id)
+        store.add_key_memory("用户正在练习稳定下来", user_id=1, memory_type="manifestation")
+        config = Mock()
+        chat = ProactiveChat(store, Mock(), config, kb=KnowledgeBase(), manifestation_kb=KnowledgeBase(MANIFESTATION_KNOWLEDGE_PATH))
+
+        prompt = chat._build_proactive_prompt(user_id=1)
+
+        assert "显化信心补给" in prompt
+        assert "小证据" in prompt
+        assert "今天可以只选一个很小的对齐动作" in prompt or "先别检查结果" in prompt
+        assert "不要追问结果" in prompt
+    finally:
+        cleanup_store(store, db_path)
+
+
+def test_proactive_manifestation_checkin_avoids_overpressure():
+    store, db_path = make_store()
+    try:
+        wish_id = store.create_manifestation_wish(1, "更稳定的工作", "我想显化更稳定的工作")
+        store.add_manifestation_evidence(1, "我今天没有反复确认", wish_id=wish_id)
+        config = Mock()
+        chat = ProactiveChat(store, Mock(), config, kb=KnowledgeBase(), manifestation_kb=KnowledgeBase(MANIFESTATION_KNOWLEDGE_PATH))
+
+        prompt = chat._build_proactive_prompt(user_id=1)
+
+        assert "频率太低" not in prompt
+        assert "结果来了没" not in prompt
+        assert "你显化得怎么样了" not in prompt
+        assert "不要问结果来了没" not in prompt
+    finally:
         cleanup_store(store, db_path)
 
 

@@ -1,0 +1,116 @@
+cases:
+  - name: anxious_no_solution_first
+    kind: reply_mode
+    user: "我好焦虑，感觉什么都做不好"
+    expect:
+      reply_mode: comfort
+      prompt_must_include:
+        - "先共情"
+        - "不要立刻讲道理"
+      prompt_must_not_include:
+        - "模式：practical"
+
+  - name: sleep_no_followup
+    kind: reply_mode
+    user: "睡了晚安"
+    expect:
+      reply_mode: soft_end
+      prompt_must_include:
+        - "不要追问"
+        - "不要开启新话题"
+      prompt_must_not_include:
+        - "只问一个关键澄清"
+
+  - name: short_ack_stays_short
+    kind: reply_mode
+    user: "嗯嗯"
+    expect:
+      reply_mode: short_ack
+      prompt_must_include:
+        - "不把小回应扩写成大段分析"
+        - "不要连续提问"
+
+  - name: celebration_no_lecture
+    kind: reply_mode
+    user: "我成功了！"
+    expect:
+      reply_mode: celebration
+      prompt_must_include:
+        - "陪对方开心"
+        - "不要说教"
+
+  - name: practical_error_help
+    kind: reply_mode
+    user: "这个报错怎么修"
+    expect:
+      reply_mode: practical
+      prompt_must_include:
+        - "先给结论"
+        - "只问一个关键澄清"
+
+  - name: weak_calendar_emotional
+    kind: calendar
+    user: "明天下午三点开会，好烦"
+    expect:
+      should_confirm_calendar: true
+      strong_intent: false
+      parsed_ok: true
+      confirmation_must_include:
+        - "你是想让我帮你记到日历里"
+
+  - name: strong_calendar_creates_without_confirmation
+    kind: calendar
+    user: "提醒我明天下午三点开会"
+    expect:
+      should_confirm_calendar: false
+      strong_intent: true
+      parsed_ok: true
+
+  - name: natural_boundary_memory
+    kind: memory_command
+    user: "以后晚上别提醒我任务"
+    expect:
+      reply_must_include:
+        - "记住这个边界"
+      memory_type: boundary
+      memory_content_must_include: "不希望晚上别提醒我任务"
+
+  - name: natural_preference_memory
+    kind: memory_command
+    user: "我希望你回复短一点"
+    expect:
+      reply_must_include:
+        - "记住这个偏好"
+      memory_type: preference
+      memory_content_must_include: "希望我回复短一点"
+
+  - name: pause_proactive
+    kind: memory_command
+    user: "暂停主动关心"
+    expect:
+      reply_must_include:
+        - "暂停主动关心"
+      memory_type: boundary
+      memory_content_must_include: "不希望被主动关心"
+      proactive_snoozed: true
+
+  - name: proactive_recent_anxiety_uses_first_aid
+    kind: proactive_topic
+    setup:
+      recent_user_messages:
+        - "我又被过去的事情拉住了，好焦虑"
+    expect:
+      prompt_must_include:
+        - "本次主动主题：频率急救"
+        - "可选频率急救包"
+
+  - name: proactive_default_light_greeting
+    kind: proactive_topic
+    setup:
+      memories:
+        - content: "用户喜欢喝咖啡"
+          memory_type: fact
+    expect:
+      prompt_must_include:
+        - "本次主动主题：轻问候"
+        - "不提显化"

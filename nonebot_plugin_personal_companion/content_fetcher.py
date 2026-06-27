@@ -1,3 +1,4 @@
+import asyncio
 import random
 import jieba
 from dataclasses import dataclass
@@ -57,8 +58,36 @@ class BilibiliFetcher:
         allow = self.config.proactive_allow_users.strip()
         if not allow:
             return user_ids
-        allowed = {int(x.strip()) for x in allow.split(",") if x.strip()}
+        allowed = set()
+        for item in allow.split(","):
+            item = item.strip()
+            if item.isdigit():
+                allowed.add(int(item))
+            elif item:
+                logger.warning(f"Ignoring invalid proactive_allow_users token: {item}")
         return [uid for uid in user_ids if uid in allowed]
+
+    def _filter_push_interval(self, user_ids: list[int], now: float) -> list[int]:
+        eligible = []
+        for uid in user_ids:
+            last_push = self._last_push.get(uid)
+            if last_push is None:
+                eligible.append(uid)
+                continue
+            hours_since = (now - last_push) / 3600
+            if hours_since >= self.config.content_push_interval_hours:
+                eligible.append(uid)
+        return eligible
+
+    def _parse_category_ids(self) -> list[int]:
+        rids = []
+        for item in self.config.content_push_bili_categories.split(","):
+            item = item.strip()
+            if item.isdigit():
+                rids.append(int(item))
+            elif item:
+                logger.warning(f"Ignoring invalid Bilibili category id: {item}")
+        return rids
 
     # ── public API ────────────────────────────────────────────
 
@@ -79,11 +108,9 @@ class BilibiliFetcher:
 
         # Check interval per user
         now = now_dt.timestamp()
-        for uid in user_ids:
-            if uid in self._last_push:
-                hours_since = (now - self._last_push[uid]) / 3600
-                if hours_since < self.config.content_push_interval_hours:
-                    continue
+        user_ids = self._filter_push_interval(user_ids, now)
+        if not user_ids:
+            return
 
         # Fetch videos
         videos = await self._fetch_videos()
@@ -123,8 +150,7 @@ class BilibiliFetcher:
 
     async def _fetch_videos(self) -> list[VideoInfo]:
         """Fetch videos from configured categories. Each category gets ~15 items."""
-        categories_str = self.config.content_push_bili_categories
-        rids = [int(x.strip()) for x in categories_str.split(",") if x.strip()]
+        rids = self._parse_category_ids()
 
         all_videos: list[VideoInfo] = []
         seen: set[str] = set()
@@ -259,7 +285,8 @@ class BilibiliFetcher:
         )
 
         try:
-            reply = self.llm.chat(
+            reply = await asyncio.to_thread(
+                self.llm.chat,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": prompt},

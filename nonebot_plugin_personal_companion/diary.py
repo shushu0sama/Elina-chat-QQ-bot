@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -23,7 +24,13 @@ class DiaryWriter:
         allow = self.config.proactive_allow_users.strip()
         if not allow:
             return user_ids
-        allowed = {int(x.strip()) for x in allow.split(",") if x.strip()}
+        allowed = set()
+        for item in allow.split(","):
+            item = item.strip()
+            if item.isdigit():
+                allowed.add(int(item))
+            elif item:
+                logger.warning(f"Ignoring invalid proactive_allow_users token: {item}")
         return [uid for uid in user_ids if uid in allowed]
 
     async def write_daily_diary(self):
@@ -52,7 +59,8 @@ class DiaryWriter:
             logger.info(f"{diary_date} user {user_id}: only {len(messages)} msgs, skipping")
             return
 
-        content = await self._generate(messages, diary_date)
+        timeline_entries = self.memory.get_timeline_entries_between(user_id, diary_date, diary_date, limit=20)
+        content = await self._generate(messages, diary_date, timeline_entries)
         if not content:
             return
 
@@ -124,7 +132,8 @@ class DiaryWriter:
         )
 
         try:
-            response = self.llm.chat(
+            response = await asyncio.to_thread(
+                self.llm.chat,
                 messages=[
                     {"role": "system", "content": "你是艾琳娜的显化日记写作模块。你帮助用户澄清愿望、收集证据、放下执念、对齐行动，但不承诺结果。"},
                     {"role": "user", "content": prompt},
@@ -159,7 +168,8 @@ class DiaryWriter:
         filepath.write_text(full_content, encoding="utf-8")
         logger.info(f"Saved manifestation diary: {filepath}")
 
-    async def _generate(self, messages: list[dict], date_str: str) -> str | None:
+    async def _generate(self, messages: list[dict], date_str: str,
+                        timeline_entries: list[dict] | None = None) -> str | None:
         conversation = []
         for m in messages:
             role_label = "你" if m["role"] == "user" else "艾琳娜"
@@ -172,6 +182,13 @@ class DiaryWriter:
             return None
 
         conversation_text = "\n".join(conversation)
+        timeline_text = "（无当天时间线事件）"
+        if timeline_entries:
+            lines = []
+            for item in timeline_entries:
+                event_time = f" {item['event_time']}" if item.get("event_time") else ""
+                lines.append(f"- {item['event_date']}{event_time}：{item['content']}")
+            timeline_text = "\n".join(lines)
 
         prompt = (
             f"以下是{date_str}你和一个朋友的完整对话记录。请你以朋友「艾琳娜」的口吻，"
@@ -184,11 +201,13 @@ class DiaryWriter:
             "- 「艾琳娜的碎碎念」：以艾琳娜的视角写几句温柔的观察或感慨，1-3句话\n"
             "- 语气自然、温柔，不肉麻，不鸡汤\n"
             "- 300-500字，不要太长\n\n"
+            f"[当天时间线事件]\n{timeline_text}\n\n"
             f"[对话记录]\n{conversation_text}"
         )
 
         try:
-            response = self.llm.chat(
+            response = await asyncio.to_thread(
+                self.llm.chat,
                 messages=[
                     {"role": "system", "content": "你是一个温柔的朋友，帮对方写个人日记。语气自然，像朋友间的记录，不是正式文书。"},
                     {"role": "user", "content": prompt},

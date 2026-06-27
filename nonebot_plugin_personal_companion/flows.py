@@ -1,3 +1,4 @@
+import asyncio
 import yaml
 import time
 from pathlib import Path
@@ -168,7 +169,8 @@ class FlowManager:
         user_prompt = f"用户刚才说：{user_response}\n\n这一步要说的引导语：\n{next_prompt}"
 
         try:
-            response = self.llm.chat(
+            response = await asyncio.to_thread(
+                self.llm.chat,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_prompt},
@@ -188,15 +190,15 @@ class FlowManager:
         tool_data = self._flow_data.get(session.tool, {})
 
         if tool_data.get("completion_mode") == "manifest_seed":
-            return self._complete_manifest_seed(session)
+            return await self._complete_manifest_seed(session)
         if tool_data.get("completion_mode") == "manifest_diary":
-            return self._complete_manifest_diary(session)
+            return await self._complete_manifest_diary(session)
         if tool_data.get("completion_mode") == "belief_rewrite":
-            return self._complete_belief_rewrite(session)
+            return await self._complete_belief_rewrite(session)
         if tool_data.get("completion_mode") == "obsession_downshift":
-            return self._complete_obsession_downshift(session)
+            return await self._complete_obsession_downshift(session)
         if tool_data.get("completion_mode") == "future_self":
-            return self._complete_future_self(session)
+            return await self._complete_future_self(session)
 
         system = (
             f"用户刚刚和你一起完成了'{tool_name}'。根据用户的最后回应，"
@@ -204,7 +206,8 @@ class FlowManager:
             "只是简单地感谢和肯定。语气柔和，30字以内。"
         )
         try:
-            response = self.llm.chat(
+            response = await asyncio.to_thread(
+                self.llm.chat,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": f"用户说：{user_response}"},
@@ -225,9 +228,10 @@ class FlowManager:
             lines.append(f"{step.get('name', '步骤')}：{answer}")
         return "\n".join(lines)
 
-    def _chat_completion(self, session: Session, system: str, max_tokens: int = 1024) -> str | None:
+    async def _chat_completion(self, session: Session, system: str, max_tokens: int = 1024) -> str | None:
         try:
-            response = self.llm.chat(
+            response = await asyncio.to_thread(
+                self.llm.chat,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": self._format_answers(session)},
@@ -240,7 +244,7 @@ class FlowManager:
             pass
         return None
 
-    def _complete_manifest_seed(self, session: Session) -> str:
+    async def _complete_manifest_seed(self, session: Session) -> str:
         system = (
             "你是艾琳娜，一个温柔、清醒、有一点小魔女感的私人显化陪伴者。"
             "根据用户完成的愿望澄清，生成一张'愿望种子卡'。\n"
@@ -250,43 +254,43 @@ class FlowManager:
             "- 输出结构：愿望种子已种下 / 真正想要的感受 / 更高版本愿望 / 正在松动的旧信念 / 今日对齐行动 / 今日显化咒语 / 放下执念提醒\n"
             "- 语气亲密但不肉麻，300字以内"
         )
-        return self._chat_completion(session, system, max_tokens=1024) or (
+        return await self._chat_completion(session, system, max_tokens=1024) or (
             "你的愿望种子已经种下。\n\n今天先不急着检查结果，只记住一件事："
             "你不是在等待奇迹，你是在成为能够承接它的人。"
         )
 
-    def _complete_manifest_diary(self, session: Session) -> str:
+    async def _complete_manifest_diary(self, session: Session) -> str:
         system = (
             "你是艾琳娜，正在帮用户完成一次显化日记。请基于用户回答做温柔复盘。\n"
             "输出结构：今日状态 / 今日选择相信 / 今日显化证据 / 今日放下 / 明日一个小行动。\n"
             "重点收集内部证据、行动证据和外部证据，不检查愿望是否立刻实现。200-300字。"
         )
-        return self._chat_completion(session, system, max_tokens=768) or "今晚先把证据收起来：你愿意复盘，本身就是在回到自己。"
+        return await self._chat_completion(session, system, max_tokens=768) or "今晚先把证据收起来：你愿意复盘，本身就是在回到自己。"
 
-    def _complete_belief_rewrite(self, session: Session) -> str:
+    async def _complete_belief_rewrite(self, session: Session) -> str:
         system = (
             "你是艾琳娜，帮助用户改写限制性信念。\n"
             "输出结构：我听见的旧信念 / 它曾经如何保护你 / 一个现在更能相信的新信念 / 今日一个小行动。\n"
             "不要强行正能量，不要说'你只要相信就会实现'。新信念要温和、可信、可落地。250字以内。"
         )
-        return self._chat_completion(session, system, max_tokens=768) or "我们先不强迫自己相信很大的话，只从一个更温和的新念头开始。"
+        return await self._chat_completion(session, system, max_tokens=768) or "我们先不强迫自己相信很大的话，只从一个更温和的新念头开始。"
 
-    def _complete_obsession_downshift(self, session: Session) -> str:
+    async def _complete_obsession_downshift(self, session: Session) -> str:
         system = (
             "你是艾琳娜，正在帮用户从执念和结果检查中降频。\n"
             "回应必须：不分析具体他人心理，不鼓励反复确认，不承诺结果。\n"
             "输出结构：命名状态 / 30秒回到身体 / 如果已经被爱会怎么照顾自己 / 接下来30分钟不要做什么、可以做什么。\n"
             "语气温柔坚定，250字以内。"
         )
-        return self._chat_completion(session, system, max_tokens=768) or "你现在不是显化失败，是又回到了检查结果。先回来，别急着追。"
+        return await self._chat_completion(session, system, max_tokens=768) or "你现在不是显化失败，是又回到了检查结果。先回来，别急着追。"
 
-    def _complete_future_self(self, session: Session) -> str:
+    async def _complete_future_self(self, session: Session) -> str:
         system = (
             "你是艾琳娜，请写一段'已经显化成功的未来自我'对用户说的话。\n"
             "要求：像未来的用户在温柔回信；强调身份更新、行动和自我照顾，不承诺控制他人。\n"
             "最后给一句今天可以执行的小行动。350字以内。"
         )
-        return self._chat_completion(session, system, max_tokens=1024) or "未来的你想说：别把自己放在等待的位置，先好好回到自己的生活里。"
+        return await self._chat_completion(session, system, max_tokens=1024) or "未来的你想说：别把自己放在等待的位置，先好好回到自己的生活里。"
 
     async def _send_completion(self, user_id: int, tool: str):
         """Called as fallback — generates and returns nothing, handled in caller."""

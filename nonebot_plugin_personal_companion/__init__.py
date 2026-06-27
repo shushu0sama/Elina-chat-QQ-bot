@@ -1,9 +1,12 @@
 import json
+import asyncio
 import random
 import re
 import jieba
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from nonebot import on_message, get_driver
 from nonebot.adapters.onebot.v11 import Bot, Event, PrivateMessageEvent
@@ -15,7 +18,13 @@ from .memory import MemoryStore
 from .personality import build_system_prompt
 from .llm_client import LLMClient
 from .proactive import ProactiveChat
-from .knowledge import KnowledgeBase, build_knowledge_prompt_personalized
+from .knowledge import (
+    MANIFESTATION_KNOWLEDGE_PATH,
+    KnowledgeBase,
+    build_knowledge_prompt_personalized,
+    build_manifestation_knowledge_prompt,
+    is_manifestation_intent,
+)
 from .flows import FlowManager
 from .content_fetcher import BilibiliFetcher
 from .diary import DiaryWriter
@@ -23,6 +32,7 @@ from .relationship import RelationshipProfiler, build_relationship_prompt
 from .turn_context import (
     analyze_turn,
     build_companion_context_prompt,
+    build_reply_mode_prompt,
     choose_reply_max_tokens,
     detect_emotions,
 )
@@ -30,6 +40,26 @@ from nonebot.log import logger
 
 from .web_search import search_web, format_search_results
 from .manifestation_quotes import build_frequency_first_aid_text
+from .feishu_calendar import (
+    FeishuCalendarClient,
+    format_calendar_event_confirmation,
+    format_calendar_intent_confirmation,
+    looks_like_calendar_request,
+    parse_calendar_request,
+    should_confirm_calendar_request,
+)
+from .prompt_builder import (
+    PromptBuilder,
+    build_anti_repeat,
+    build_thread_context,
+    build_time_lock,
+    format_history_message,
+    format_timeline_entries,
+    history_time_label,
+)
+from .message_handler import MessageHandler, MessageHandlerCallbacks
+from .reminders import ReminderService
+from .services import AppServices
 
 __plugin_meta__ = PluginMetadata(
     name="personal_companion",
@@ -72,10 +102,15 @@ memory_store: MemoryStore | None = None
 llm: LLMClient | None = None
 proactive_chat: ProactiveChat | None = None
 knowledge_base: KnowledgeBase | None = None
+manifestation_knowledge_base: KnowledgeBase | None = None
 flow_manager: FlowManager | None = None
 bili_fetcher: BilibiliFetcher | None = None
 diary_writer: DiaryWriter | None = None
 rel_profiler: RelationshipProfiler | None = None
+feishu_calendar_client: FeishuCalendarClient | None = None
+reminder_service: ReminderService | None = None
+app_services: AppServices | None = None
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
 # ── Error handling ─────────────────────────────────────────────
 
@@ -97,6 +132,14 @@ def _llm_fallback(user_id: int | None = None) -> str:
         return random.choice(fresh)
 
     return "我这边刚刚没生成出可用的回复，你把上一句再发我一次好吗？"
+
+
+def _maybe_snooze_proactive_for_user_message(user_id: int, user_msg: str):
+    if memory_store is None or not hasattr(memory_store, "set_proactive_snooze"):
+        return
+    turn_ctx = analyze_turn(user_msg, memory_store.get_recent_messages(limit=6, user_id=user_id), flow_manager)
+    if turn_ctx.should_end_softly:
+        memory_store.set_proactive_snooze(user_id, datetime.now(timezone.utc) + timedelta(hours=10), "user-ended-conversation")
 
 
 
@@ -215,7 +258,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent):
             "可以描述你看到的、表达你的感受或想法。2-3句话即可，不要太长。"
             "如果你看不懂这张图（比如是纯色块或模糊的），就诚实地说看不清。"
         )
-        reply = llm.chat_vision(prompt, image_urls[:3], max_tokens=384)
+        reply = await asyncio.to_thread(llm.chat_vision, prompt, image_urls[:3], "", 2, 384)
         if reply:
             memory_store.save_message("user", "[图片]", event.user_id)
             memory_store.save_message("assistant", reply, event.user_id)
@@ -234,7 +277,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent):
             "请结合图片内容回应对方。语气自然，像朋友聊天。2-3句话。"
             "如果你实在看不清图片，就根据对方的文字回应，顺便提一句图片没加载出来。"
         )
-        reply = llm.chat_vision(prompt, image_urls[:3], max_tokens=384)
+        reply = await asyncio.to_thread(llm.chat_vision, prompt, image_urls[:3], "", 2, 384)
         if reply:
             memory_store.save_message("user", f"[图片] {user_msg}", event.user_id)
             memory_store.save_message("assistant", reply, event.user_id)
@@ -282,139 +325,34 @@ async def _process_text_message(user_msg: str, event, bot):
     """Handle a regular text message (extracted from main handler for reuse)."""
     global memory_store, llm, plugin_config
     assert memory_store is not None and llm is not None and plugin_config is not None
-
-    # 1. Save user message
-    msg_id = memory_store.save_message("user", user_msg, event.user_id)
-
-    # 2. Explicit memory management commands
-    memory_reply = _handle_memory_management_command(user_msg, event.user_id)
-    if memory_reply:
-        memory_store.save_message("assistant", memory_reply, event.user_id)
-        await _send_event_reply(bot, event, memory_reply)
-        return
-
-    # 3. Manifestation dashboard and lifecycle commands
-    manifest_reply = _handle_manifestation_command(user_msg, event.user_id)
-    if manifest_reply:
-        memory_store.save_message("assistant", manifest_reply, event.user_id)
-        await _send_event_reply(bot, event, manifest_reply)
-        return
-
-    # 4. Check if user wants to save a memory explicitly
-    if user_msg.startswith("记住："):
-        memory_text = user_msg[3:].strip()
-        memory_store.add_key_memory(memory_text, source_msg_id=msg_id, user_id=event.user_id, importance=5)
-        await _send_event_reply(bot, event, f"记住了：{memory_text}")
-        return
-
-    # 4. Retrieve relevant memories (emotion-boosted + entity association)
-    keywords = _extract_keywords(user_msg)
-    user_emotions = detect_emotions(user_msg)
-    retrieved = memory_store.retrieve_memories_with_emotion(keywords, event.user_id, user_emotions)
-
-    # 4b. Entity association: find related memories via shared entities
-    if retrieved:
-        associated = memory_store.get_entity_associated_memories(
-            retrieved[:3], event.user_id, set(retrieved)
-        )
-    else:
-        associated = []
-
-    # 5. Build the full message list for the LLM
-    turn_ctx = analyze_turn(user_msg, memory_store.get_recent_messages(plugin_config.max_recent_messages, event.user_id), flow_manager)
-    messages = _build_messages(user_msg, retrieved, event.user_id, associated, turn_ctx)
-    max_tokens = choose_reply_max_tokens(turn_ctx)
-
-    # 5. Call LLM — with budget check, function calling if web search is enabled
-    reply = ""
-    if plugin_config and plugin_config.web_search_enabled and turn_ctx.allow_web_search:
-        try:
-            response = llm.chat_with_tools(messages, tools=[WEB_SEARCH_TOOL])
-
-            if response is None:
-                reply = llm.chat(messages, max_tokens=max_tokens) or _llm_fallback(event.user_id)
-            else:
-                choice = response.choices[0]
-                msg = choice.message
-
-                if msg.tool_calls:
-                    assistant_msg = {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
-                                }
-                            }
-                            for tc in msg.tool_calls
-                        ],
-                        "content": msg.content or "",
-                    }
-                    rc = getattr(msg, "reasoning_content", None)
-                    if rc:
-                        assistant_msg["reasoning_content"] = rc
-                    messages.append(assistant_msg)
-
-                    for tc in msg.tool_calls:
-                        if tc.function.name == "web_search":
-                            try:
-                                args = json.loads(tc.function.arguments)
-                                query = args.get("query", user_msg)
-                                results = search_web(query)
-                                formatted = format_search_results(results, query)
-                            except Exception as e:
-                                logger.warning(f"Search error: {e}")
-                                formatted = f"搜索「{tc.function.arguments}」时出错，请根据已有知识回答。"
-
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": formatted,
-                            })
-
-                    reply = llm.chat(messages, max_tokens=max(1024, max_tokens)) or _llm_fallback(event.user_id)
-                else:
-                    reply = msg.content or ""
-                    if choice.finish_reason == "length":
-                        messages.append({"role": "assistant", "content": reply})
-                        messages.append({
-                            "role": "user",
-                            "content": "继续刚才被截断的回复，只输出后续内容，不要重复已经说过的部分。",
-                        })
-                        reply += llm.chat(messages, max_tokens=max_tokens)
-                    reply = llm.complete_if_needed(messages, reply, max_tokens=256)
-        except Exception as e:
-            logger.warning(f"Function calling failed, falling back to regular chat: {e}")
-            reply = llm.chat(messages, max_tokens=max_tokens) or _llm_fallback(event.user_id)
-    else:
-        reply = llm.chat(messages, max_tokens=max_tokens) or _llm_fallback(event.user_id)
-
-    reply = llm.complete_if_needed(messages, reply, max_tokens=256)
-
-    if not reply:
-        reply = _llm_fallback(event.user_id)
-
-    # 6. Save assistant reply
-    memory_store.save_message("assistant", reply, event.user_id)
-
-    # 7. Chunk and send reply
-    await _send_event_reply(bot, event, reply)
-
-    # 8. Auto-extract memories
-    await _maybe_extract_memories(event.user_id)
-
-    # 9. Generate summary if needed
-    summary_count = memory_store.message_count_since_last_summary(event.user_id)
-    if summary_count >= plugin_config.summary_trigger_count:
-        end_msg_id = memory_store.get_latest_message_id(event.user_id)
-        start_msg_id = memory_store.get_oldest_message_id_after(event.user_id, end_msg_id - summary_count)
-        recent = memory_store.get_recent_messages(plugin_config.max_recent_messages, event.user_id)
-        summary = llm.generate_summary(recent)
-        if summary:
-            memory_store.save_summary(summary, start_msg_id, end_msg_id, event.user_id)
+    services = app_services or AppServices(
+        config=plugin_config,
+        memory=memory_store,
+        llm=llm,
+        proactive_chat=proactive_chat,
+        knowledge_base=knowledge_base,
+        manifestation_knowledge_base=manifestation_knowledge_base,
+        flow_manager=flow_manager,
+        bili_fetcher=bili_fetcher,
+        diary_writer=diary_writer,
+        relationship_profiler=rel_profiler,
+        feishu_calendar_client=feishu_calendar_client,
+        reminder_service=reminder_service,
+    )
+    callbacks = MessageHandlerCallbacks(
+        send_event_reply=_send_event_reply,
+        handle_memory_command=_handle_memory_management_command,
+        handle_manifestation_command=_handle_manifestation_command,
+        maybe_extract_memories=_maybe_extract_memories,
+        extract_keywords=_extract_keywords,
+        retrieve_timeline_for_turn=_retrieve_timeline_for_turn,
+        handle_date_time_question=_handle_date_time_question,
+        llm_fallback=_llm_fallback,
+        strip_outgoing_speaker_prefix=_strip_outgoing_speaker_prefix,
+        maybe_snooze_proactive_for_user_message=_maybe_snooze_proactive_for_user_message,
+        build_messages=_build_messages,
+    )
+    await MessageHandler(services, callbacks, WEB_SEARCH_TOOL).process_text(user_msg, event, bot)
 
 
 async def _maybe_extract_memories(user_id: int):
@@ -433,7 +371,7 @@ async def _maybe_extract_memories(user_id: int):
         return
 
     existing = memory_store.get_all_key_memories(user_id)
-    structured = llm.extract_memories_structured(recent, existing)
+    structured = await asyncio.to_thread(llm.extract_memories_structured, recent, existing)
 
     if not structured:
         memory_store.save_extraction_checkpoint(user_id, latest_msg_id)
@@ -471,9 +409,48 @@ def _format_memory_update_result(action: str, matches: list[str]) -> str:
     return f"已{action}：\n{shown}{suffix}"
 
 
+def _extract_natural_memory_preference(user_msg: str) -> tuple[str, str] | None:
+    stripped = user_msg.strip()
+    boundary_patterns = [
+        r"^(?:以后|之后)?(?:别|不要)(?:再)?(?P<body>.+)$",
+        r"^(?:以后|之后)?(?P<body>.+?(?:别|不要)(?:再)?.+)$",
+        r"^我不喜欢(?P<body>.+)$",
+    ]
+    for pattern in boundary_patterns:
+        match = re.match(pattern, stripped)
+        if match:
+            body = match.group("body").strip(" ，。.!！?？")
+            if body:
+                return "boundary", body
+
+    preference_patterns = [
+        r"^我喜欢(?P<body>.+)$",
+        r"^我希望你(?P<body>.+)$",
+        r"^你以后可以(?P<body>.+)$",
+    ]
+    for pattern in preference_patterns:
+        match = re.match(pattern, stripped)
+        if match:
+            body = match.group("body").strip(" ，。.!！?？")
+            if body:
+                return "preference", body
+    return None
+
+
 def _handle_memory_management_command(user_msg: str, user_id: int) -> str | None:
     assert memory_store is not None
     stripped = user_msg.strip()
+
+    if stripped in {"暂停主动关心", "先别主动找我", "别主动找我", "不要主动找我", "以后别主动找我"}:
+        memory_store.set_proactive_snooze(user_id, datetime.now(timezone.utc) + timedelta(days=3650), "user-paused-proactive")
+        memory_store.add_key_memory("用户不希望被主动关心", user_id=user_id, importance=5, memory_type="boundary", status="active")
+        return "好，我会暂停主动关心。你想恢复时，可以说「恢复主动关心」。"
+
+    if stripped in {"恢复主动关心", "可以主动找我了", "重新开启主动关心"}:
+        if hasattr(memory_store, "clear_proactive_snooze"):
+            memory_store.clear_proactive_snooze(user_id)
+        memory_store.delete_key_memories(user_id, "不希望被主动关心")
+        return "好，我恢复主动关心。但我还是会避开你说过不想被打扰的时候。"
 
     if stripped in {"我的记忆", "你记得我什么", "整理一下你记得我的什么", "查看记忆", "记忆列表"}:
         return memory_store.build_memory_overview(user_id)
@@ -515,6 +492,17 @@ def _handle_memory_management_command(user_msg: str, user_id: int) -> str | None
                 return "可以说「以后别再提：关键词」来隐藏相关记忆，但不删除它。"
             matches = memory_store.update_key_memory_status(user_id, query, "suppressed")
             return _format_memory_update_result("设为不再主动提起", matches)
+
+    natural = _extract_natural_memory_preference(stripped)
+    if natural:
+        memory_type, body = natural
+        if memory_type == "boundary":
+            content = f"用户不希望{body}"
+            memory_store.add_key_memory(content, user_id=user_id, importance=5, memory_type="boundary", status="active")
+            return f"好，我记住这个边界：不{body}。如果以后想改，可以说「忘掉：{body}」。"
+        content = f"用户希望我{body}"
+        memory_store.add_key_memory(content, user_id=user_id, importance=4, memory_type="preference", status="active")
+        return f"好，我记住这个偏好：{body}。"
 
     return None
 
@@ -580,161 +568,131 @@ def _extract_keywords(text: str, top_n: int = 5) -> list[str]:
 
 
 
+def _extract_timeline_query_dates(text: str, now: datetime | None = None) -> list[str]:
+    now = now or datetime.now(BEIJING_TZ)
+    dates: list[str] = []
+
+    def add(date_value) -> None:
+        date_str = date_value.strftime("%Y-%m-%d")
+        if date_str not in dates:
+            dates.append(date_str)
+
+    relative_offsets = {"前天": -2, "昨天": -1, "今天": 0, "明天": 1, "后天": 2}
+    for marker, offset in relative_offsets.items():
+        if marker in text:
+            add(now.date() + timedelta(days=offset))
+
+    for match in re.finditer(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?", text):
+        year, month, day = (int(x) for x in match.groups())
+        add(datetime(year, month, day).date())
+
+    for match in re.finditer(r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]?", text):
+        month, day = (int(x) for x in match.groups())
+        add(datetime(now.year, month, day).date())
+
+    return dates
+
+
+def _retrieve_timeline_for_turn(user_msg: str, keywords: list[str], user_id: int) -> list[dict]:
+    assert memory_store is not None
+    by_date: list[dict] = []
+    for date_str in _extract_timeline_query_dates(user_msg):
+        by_date.extend(memory_store.get_timeline_entries_between(user_id, date_str, date_str, limit=8))
+
+    by_keyword = memory_store.retrieve_timeline_entries(keywords, user_id, limit=4)
+    seen: set[int] = set()
+    merged: list[dict] = []
+    for entry in by_date + by_keyword:
+        entry_id = entry.get("id")
+        if entry_id is not None:
+            if entry_id in seen:
+                continue
+            seen.add(entry_id)
+        merged.append(entry)
+    return merged[:8]
+
+
+_DATE_TRIGGERS = [
+    "今天几号", "今天多少号", "今天几月几号", "什么日期",
+    "现在几点", "现在什么时间", "几点了", "什么时间",
+    "今天星期几", "星期几", "周几", "周几了",
+]
+
+
+def _handle_date_time_question(user_msg: str, now: datetime) -> str | None:
+    """Deterministically answer date/time questions without LLM."""
+    msg = user_msg.strip()
+    if not msg:
+        return None
+
+    is_date = any(t in msg for t in ["几号", "几月几号", "什么日期", "多少号"])
+    is_time = any(t in msg for t in ["几点", "什么时间", "几点了"])
+    is_weekday = any(t in msg for t in ["星期几", "周几", "礼拜几"])
+
+    if not is_date and not is_time and not is_weekday:
+        return None
+
+    weekday_names = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    weekday = weekday_names[now.weekday()]
+    date_str = now.strftime("%Y年%m月%d日")
+
+    parts = []
+    if is_date:
+        parts.append(f"今天是北京时间 {date_str}")
+    if is_weekday:
+        parts.append(weekday)
+    if is_time:
+        parts.append(f"现在是{now.hour}点{now.minute}分")
+    return "，".join(parts) if parts else None
+
+
+def _build_time_lock(now: datetime) -> str:
+    return build_time_lock(now)
+
+
+def _history_time_label(msg: dict) -> str:
+    return history_time_label(msg)
+
+
+def _format_history_message(msg: dict) -> dict:
+    return format_history_message(msg)
+
+
+def _strip_outgoing_speaker_prefix(text: str) -> str:
+    return re.sub(r"^\s*(?:艾琳娜|小鼠|助手|AI|机器人)\s*[:：]\s*", "", text).strip()
+
+
+def _format_timeline_entries(entries: list[dict]) -> str:
+    return format_timeline_entries(entries)
+
+
 def _build_messages(user_msg: str, retrieved_memories: list[str], user_id: int = 0,
                     associated_memories: list[str] | None = None,
-                    turn_ctx=None) -> list[dict]:
-    global knowledge_base
+                    turn_ctx=None, timeline_entries: list[dict] | None = None) -> list[dict]:
     assert memory_store is not None and plugin_config is not None
+    return PromptBuilder(
+        memory_store,
+        plugin_config,
+        knowledge_base=knowledge_base,
+        manifestation_knowledge_base=manifestation_knowledge_base,
+        relationship_profiler=rel_profiler,
+        flow_manager=flow_manager,
+        extract_keywords=_extract_keywords,
+        now_provider=datetime.now,
+    ).build_messages(user_msg, retrieved_memories, user_id, associated_memories, turn_ctx, timeline_entries)
 
-    messages: list[dict] = []
-
-    # System: injected memories (max 3, shuffled for variety, lower importance ones may be dropped)
-    if retrieved_memories:
-        # Shuffle and cap at 3 — prevents the same memories dominating every turn
-        mems = retrieved_memories.copy()
-        random.shuffle(mems)
-        mems = mems[:3]
-        memory_block = "[你记得以下关于用户的当前有效信息。只能在和用户本轮话题自然相关时轻轻使用；不要为了展示记忆而主动翻旧账：]\n"
-        for mem in mems:
-            memory_block += f"- {mem}\n"
-        messages.append({"role": "system", "content": memory_block})
-
-    # System: entity-associated memories (associative recall — shared entities with primary memories)
-    if associated_memories:
-        assoc = associated_memories[:2]
-        assoc_block = (
-            "[你联想到了以下仍然有效的相关信息——只有话题自然关联到时才可以轻轻提起，绝对不要追问旧事：]\n"
-        )
-        for mem in assoc:
-            assoc_block += f"- {mem}\n"
-        messages.append({"role": "system", "content": assoc_block})
-
-    # System: philosophy knowledge (retrieved by keywords from user message)
-    if knowledge_base:
-        kb_prompt = build_knowledge_prompt_personalized(
-            user_msg, knowledge_base, user_id, memory_store
-        )
-        if kb_prompt:
-            messages.append({"role": "system", "content": kb_prompt})
-
-    # System: relationship context (per-user adaptation)
-    if rel_profiler:
-        rel_prompt = build_relationship_prompt(user_id, rel_profiler)
-        if rel_prompt:
-            messages.append({"role": "system", "content": rel_prompt})
-
-    recent = memory_store.get_recent_messages(plugin_config.max_recent_messages, user_id)
-
-    # System: current-turn companion context
-    turn_ctx = turn_ctx or analyze_turn(user_msg, recent, flow_manager)
-    companion_ctx = build_companion_context_prompt(turn_ctx)
-    if companion_ctx:
-        messages.append({"role": "system", "content": companion_ctx})
-
-    # System: manifestation context
-    manifestation_memories = memory_store.get_manifestation_memories(user_id, limit=5)
-    if manifestation_memories:
-        manifest_block = (
-            "[艾琳娜显化系统记忆——用于愿望澄清、信念改写、显化日记和执念降频：]\n"
-            + "\n".join(f"- {m}" for m in manifestation_memories)
-            + "\n使用规则：只在用户聊到显化、愿望、信念、执念、未来自我时自然使用；不要主动保证结果，不要把显化变成压力。"
-        )
-        messages.append({"role": "system", "content": manifest_block})
-
-    # System: frequency first-aid for manifestation anxiety and old stories
-    recent_proactive = memory_store.get_recent_proactive_content(user_id, limit=3)
-    first_aid = build_frequency_first_aid_text(user_msg, recent_proactive)
-    if first_aid:
-        messages.append({"role": "system", "content": (
-            "[当前用户可能被过去、焦虑、低频或旧故事拉住。请优先温柔降频，再回应具体内容。]\n"
-            + first_aid
-            + "\n使用边界：不要说用户频率太低，不要要求立刻开心，不要承诺结果；目标只是从焦虑降到中性。"
-        )})
-
-    # System: conversation thread (keeps multi-turn coherence)
-    thread_ctx = _build_thread_context(recent, user_msg)
-    if thread_ctx:
-        messages.append({"role": "system", "content": thread_ctx})
-
-    # System: anti-repetition — show recent bot replies so model avoids repeating
-    anti_repeat = _build_anti_repeat(recent)
-    if anti_repeat:
-        messages.append({"role": "system", "content": anti_repeat})
-
-    # System: personality
-    personality_prompt = build_system_prompt(user_id=user_id, turn_context=turn_ctx)
-    messages.append({"role": "system", "content": personality_prompt})
-
-    # Conversation history
-    for msg in recent:
-        messages.append(msg)
-
-    if not (messages and messages[-1]["role"] == "user" and messages[-1]["content"] == user_msg):
-        messages.append({"role": "user", "content": user_msg})
-
-    return messages
 
 def _build_anti_repeat(recent_messages: list[dict]) -> str:
-    """Build a directive showing the bot's recent replies so it avoids repeating itself."""
-    bot_replies = [m["content"] for m in recent_messages if m["role"] == "assistant"]
-    if len(bot_replies) < 2:
-        return ""
-
-    # Take the last 3-5 bot replies
-    recent_replies = bot_replies[-5:]
-    lines = ["【重要：你最近几轮说过这些话，本次回复必须有所不同——不要重复相同的意思、相同的句式、相同的口头禅：】"]
-    for i, reply in enumerate(recent_replies, 1):
-        snippet = reply[:80].replace("\n", " ")
-        lines.append(f"  {i}. {snippet}...")
-    lines.append("请换个角度、换个语气、换个切入点。如果实在想不出不同的回应，就干脆换个话题。")
-    return "\n".join(lines)
+    return build_anti_repeat(recent_messages)
 
 
 def _build_thread_context(recent_messages: list[dict], current_msg: str) -> str:
-    """Build a compact context line summarizing the recent conversation thread."""
-    if len(recent_messages) < 2:
-        return ""
-
-    # Take the last 3-4 exchanges (6-8 messages)
-    recent_exchanges = recent_messages[-8:]
-    user_msgs = [m["content"] for m in recent_exchanges if m["role"] == "user"]
-
-    if not user_msgs:
-        return ""
-
-    # Extract keywords from recent user messages to detect topic continuity
-    all_keywords: list[str] = []
-    for msg in user_msgs[-3:]:
-        all_keywords.extend(_extract_keywords(msg, top_n=3))
-
-    # Find recurring keywords (appear in >= 2 recent messages)
-    kw_counts = Counter(all_keywords)
-    recurring = [kw for kw, cnt in kw_counts.items() if cnt >= 2]
-
-    lines = ["[当前对话线索——请在回复时保持话题连贯：]"]
-    if recurring:
-        lines.append(f"- 对方最近反复提到的词：{'、'.join(recurring[:3])}")
-
-    # Summarize the last exchange
-    if len(recent_exchanges) >= 2:
-        last = recent_exchanges[-2:]
-        summary_parts = []
-        for m in last:
-            role = "对方" if m["role"] == "user" else "你"
-            snippet = m["content"][:60].replace("\n", " ")
-            summary_parts.append(f"{role}：{snippet}")
-        lines.append(f"- 上一轮：{' | '.join(summary_parts)}")
-
-    if lines:
-        lines.append("- 现在对方说：" + current_msg[:100])
-        lines.append("- 请确保你的回应承接上一轮的话题。如果对方用了代词（'那个''它''这样'），要根据上下文理解具体指什么。")
-
-    return "\n".join(lines)
+    return build_thread_context(recent_messages, current_msg, _extract_keywords)
 
 
 @get_driver().on_startup
 async def _startup():
-    global plugin_config, memory_store, llm, proactive_chat, knowledge_base, flow_manager, bili_fetcher, diary_writer, rel_profiler
+    global plugin_config, memory_store, llm, proactive_chat, knowledge_base, manifestation_knowledge_base, flow_manager, bili_fetcher, diary_writer, rel_profiler, feishu_calendar_client, reminder_service, app_services
 
     # Import scheduler here — NoneBot is initialized by now
     from nonebot import require
@@ -749,11 +707,37 @@ async def _startup():
         model=plugin_config.deepseek_model,
     )
     knowledge_base = KnowledgeBase()
-    proactive_chat = ProactiveChat(memory_store, llm, plugin_config, knowledge_base)
+    manifestation_knowledge_base = KnowledgeBase(MANIFESTATION_KNOWLEDGE_PATH)
+    proactive_chat = ProactiveChat(memory_store, llm, plugin_config, knowledge_base, manifestation_knowledge_base)
     flow_manager = FlowManager(llm)
     bili_fetcher = BilibiliFetcher(llm, memory_store, plugin_config)
     diary_writer = DiaryWriter(llm, memory_store, plugin_config)
     rel_profiler = RelationshipProfiler(memory_store)
+    reminder_service = ReminderService(memory_store, plugin_config)
+    if plugin_config.feishu_calendar_enabled and plugin_config.feishu_app_id and plugin_config.feishu_app_secret and plugin_config.feishu_calendar_id:
+        feishu_calendar_client = FeishuCalendarClient(
+            plugin_config.feishu_app_id,
+            plugin_config.feishu_app_secret,
+            plugin_config.feishu_calendar_id,
+            plugin_config.feishu_timezone,
+        )
+    else:
+        feishu_calendar_client = None
+
+    app_services = AppServices(
+        config=plugin_config,
+        memory=memory_store,
+        llm=llm,
+        proactive_chat=proactive_chat,
+        knowledge_base=knowledge_base,
+        manifestation_knowledge_base=manifestation_knowledge_base,
+        flow_manager=flow_manager,
+        bili_fetcher=bili_fetcher,
+        diary_writer=diary_writer,
+        relationship_profiler=rel_profiler,
+        feishu_calendar_client=feishu_calendar_client,
+        reminder_service=reminder_service,
+    )
 
     # Initialize web search backend based on config
     try:
@@ -797,10 +781,22 @@ async def _startup():
         replace_existing=True,
     )
 
+    # Register local reminder scan job
+    if plugin_config.reminder_enabled:
+        scheduler.add_job(
+            reminder_service.scan_and_send_due,
+            trigger="interval",
+            seconds=plugin_config.reminder_scan_interval_seconds,
+            jitter=5,
+            id="local_reminders",
+            replace_existing=True,
+        )
+
     logger.info(f"Plugin loaded. DB: {plugin_config.memory_db_path}")
     logger.info(f"Model: {plugin_config.deepseek_model}")
     logger.info(f"Nickname: {plugin_config.bot_nickname}")
     logger.info(f"Knowledge base: {len(knowledge_base.concepts)} concepts loaded")
+    logger.info(f"Manifestation knowledge base: {len(manifestation_knowledge_base.concepts)} concepts loaded")
     logger.info(f"Flow tools: process ({len(flow_manager._get_steps('process'))} steps), "
           f"mini ({len(flow_manager._get_steps('mini_process'))} steps), "
           f"appreciation ({len(flow_manager._get_steps('appreciation'))} steps)")
@@ -813,6 +809,9 @@ async def _startup():
           f"categories={plugin_config.content_push_bili_categories}, "
           f"max_per_push={plugin_config.content_push_max_per_push}")
     logger.info("Daily diary: scheduled at 00:00 each day")
+    logger.info(f"Local reminders: enabled={plugin_config.reminder_enabled}, "
+          f"scan_interval={plugin_config.reminder_scan_interval_seconds}s, "
+          f"timezone={plugin_config.reminder_timezone}")
     logger.info(f"Web search: enabled={plugin_config.web_search_enabled}, "
           f"backend={plugin_config.web_search_backend}, "
           f"max_results={plugin_config.web_search_max_results}")

@@ -184,17 +184,18 @@ class LLMClient:
     def generate_summary(self, messages: list[dict]) -> str:
         """Generate a concise summary of recent conversation."""
         prompt = (
-            "请用3-5个要点总结以下对话中的关键信息（用户提到的事实、偏好、事件等），用中文：\n\n"
+            "请用3-5个要点总结以下对话中的关键信息（用户提到的事实、偏好、事件等），用中文。\n"
+            "不要把历史内容写成当前正在发生。只输出要点本身，不要加时间标记。\n\n"
         )
         conversation = "\n".join(
-            f"{"用户" if m["role"] == "user" else "助手"}: {m["content"]}"
+            f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
             for m in messages
         )
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "你是一个对话摘要助手，只总结事实信息。"},
+                    {"role": "system", "content": "你是一个对话摘要助手。只总结事实信息，不要加时间标记。"},
                     {"role": "user", "content": prompt + conversation},
                 ],
                 temperature=0.3,

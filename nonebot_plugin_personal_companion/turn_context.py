@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 
 class FlowInviteChecker(Protocol):
@@ -24,12 +24,23 @@ SHORT_ACKS = {"嗯", "嗯嗯", "好", "好吧", "哦", "行", "可以", "收到"
 CELEBRATION_MARKERS = ["好消息", "拿到", "过了", "中了", "成功", "太棒", "终于"]
 
 
+ReplyMode = Literal[
+    "short_ack",
+    "comfort",
+    "celebration",
+    "practical",
+    "soft_end",
+    "casual",
+]
+
+
 @dataclass(frozen=True)
 class TurnContext:
     emotions: list[str]
     intent: str
     intensity: str
     reply_length: str
+    reply_mode: ReplyMode
     allow_question: bool
     allow_web_search: bool
     flow_invite: str
@@ -95,6 +106,19 @@ def analyze_turn(
     else:
         reply_length = "normal"
 
+    if intent == "ending":
+        reply_mode: ReplyMode = "soft_end"
+    elif intent == "short_ack":
+        reply_mode = "short_ack"
+    elif intent == "venting":
+        reply_mode = "comfort"
+    elif intent == "celebrating":
+        reply_mode = "celebration"
+    elif intent == "factual":
+        reply_mode = "practical"
+    else:
+        reply_mode = "casual"
+
     allow_question = recent_questions < 2 and intent not in ["ending", "short_ack"]
     allow_web_search = intent == "factual" or any(w in text for w in SEARCH_MARKERS)
 
@@ -110,6 +134,7 @@ def analyze_turn(
         intent=intent,
         intensity=intensity,
         reply_length=reply_length,
+        reply_mode=reply_mode,
         allow_question=allow_question,
         allow_web_search=allow_web_search,
         flow_invite=flow_invite,
@@ -117,6 +142,29 @@ def analyze_turn(
         recent_questions=recent_questions,
         recently_invited_flow=recently_invited_flow,
     )
+
+
+def build_reply_mode_prompt(ctx: TurnContext) -> str:
+    lines = ["[本轮回复模式：]"]
+    if ctx.reply_mode == "soft_end":
+        lines.append("- 模式：soft_end。目标是温柔收尾，让对方安心离开。")
+        lines.append("- 1-2句即可；不要追问，不要开启新话题，不要邀请流程。")
+    elif ctx.reply_mode == "short_ack":
+        lines.append("- 模式：short_ack。目标是轻轻接住短回应，不把小回应扩写成大段分析。")
+        lines.append("- 1句或很短的2句即可；可以附和、轻松回应，但不要连续提问。")
+    elif ctx.reply_mode == "comfort":
+        lines.append("- 模式：comfort。目标是先让对方感觉被理解，再给一个很小的下一步。")
+        lines.append("- 2-4句；先共情，不要立刻讲道理、列清单或催对方行动。")
+    elif ctx.reply_mode == "celebration":
+        lines.append("- 模式：celebration。目标是陪对方开心，而不是抢走话题或转成建议。")
+        lines.append("- 语气轻快真诚；可以放大好消息的感受，但不要说教。")
+    elif ctx.reply_mode == "practical":
+        lines.append("- 模式：practical。目标是直接帮对方解决问题。")
+        lines.append("- 先给结论或第一步，再给必要步骤；如果信息不足，只问一个关键澄清。")
+    else:
+        lines.append("- 模式：casual。目标是像朋友一样自然承接当前话题。")
+        lines.append("- 不要把普通聊天强行变成任务、流程、总结或建议。")
+    return "\n".join(lines)
 
 
 def build_companion_context_prompt(ctx: TurnContext) -> str:

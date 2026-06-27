@@ -74,10 +74,13 @@ class TestToolDetection:
     def test_detect_manifest_seed(self, flow_manager):
         assert flow_manager.detect_tool_request("我想显化一段关系") == "manifest_seed"
         assert flow_manager.detect_tool_request("帮我显化更好的事业") == "manifest_seed"
+        assert flow_manager.detect_tool_request("帮我下一个宇宙订单") == "manifest_seed"
+        assert flow_manager.detect_tool_request("整理显化清单") == "manifest_seed"
 
     def test_detect_manifest_diary(self, flow_manager):
         assert flow_manager.detect_tool_request("做显化日记") == "manifest_diary"
         assert flow_manager.detect_tool_request("今天有什么显化证据") == "manifest_diary"
+        assert flow_manager.detect_tool_request("做一下感恩书写") == "manifest_diary"
 
     def test_detect_belief_rewrite(self, flow_manager):
         assert flow_manager.detect_tool_request("帮我改写信念") == "belief_rewrite"
@@ -86,9 +89,11 @@ class TestToolDetection:
     def test_detect_obsession_downshift(self, flow_manager):
         assert flow_manager.detect_tool_request("我又执念了") == "obsession_downshift"
         assert flow_manager.detect_tool_request("为什么还没发生") == "obsession_downshift"
+        assert flow_manager.detect_tool_request("我一直反复确认") == "obsession_downshift"
 
     def test_detect_future_self(self, flow_manager):
         assert flow_manager.detect_tool_request("让未来的我跟我说话") == "future_self"
+        assert flow_manager.detect_tool_request("我想听已经拥有的我") == "future_self"
 
     def test_detect_no_match(self, flow_manager):
         assert flow_manager.detect_tool_request("今天天气真好") is None

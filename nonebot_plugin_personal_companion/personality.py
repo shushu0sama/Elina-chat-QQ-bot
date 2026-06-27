@@ -26,9 +26,11 @@ def _load_yaml(path: Path) -> dict:
 
 
 def _time_context(now: datetime) -> str:
-    """Return a precise time-of-day context so the bot is aware of the current time."""
+    """Return a precise time context so the bot is aware of the current date and time."""
     hour = now.hour
     minute = now.minute
+    date_str = now.strftime("%Y年%m月%d日")
+    iso_date = now.strftime("%Y-%m-%d")
     time_str = f"{hour:02d}:{minute:02d}"
     weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
 
@@ -61,8 +63,10 @@ def _time_context(now: datetime) -> str:
         vibe = "时间不早了但还不是深夜。对方可能在准备休息了。"
 
     return (
-        f"现在是北京时间 {time_str}，{weekday}{period}。{vibe}\n"
-        f"重要：你的所有回复必须与当前时间吻合。不要在不合理的时间说早安/晚安/午安。"
+        f"现在是北京时间 {date_str}（{iso_date}）{time_str}，{weekday}{period}。{vibe}\n"
+        f"重要：你的所有回复必须与当前日期和时间吻合。历史聊天、摘要、记忆、日记里的日期都只是过去发生时间，不能当成今天。"
+        f"不要在不合理的时间说早安/晚安/午安，也不要把旧日期说成现在。"
+        f"关键：你的回复里绝对不要出现「北京时间」「几点几分」「年月日」这类时间文字，用户不需要知道你头脑里的时钟。"
     )
 
 
